@@ -608,7 +608,7 @@ class NvmlMonitor:
         self.thread: Optional[threading.Thread] = None
 
         self.max_temp: Optional[int] = None
-        self.max_hotspot: Optional[int] = None
+        self.max_hotspot: Optional[float] = None
         self.max_power: Optional[float] = None
         self.any_throttle: bool = False
         self.last_snapshot: Optional[MonitorSnapshot] = None
@@ -875,7 +875,7 @@ def evaluate_candidate(
                 monitor.stop()
             return CandidateResult(
                 False,
-                "GPUBURN_UNCONFIRMED_ZERO_ERRORS",
+                "GPUBURN_ERRORS_DETECTED",
                 monitor.max_temp if monitor else None,
                 monitor.max_power if monitor else None,
                 monitor.any_throttle if monitor else None,
