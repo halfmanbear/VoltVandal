@@ -39,6 +39,17 @@ Typical usage:
     --mode uv --bin-min-mv 850 --bin-max-mv 950 --step-mv 5 --stress-seconds 90 ^
     --doloming .\doloMing\stress.py --doloming-mode ray
 
+  # vlock: anchor at 987 mV, find max freq there, then UV-sweep all lower bins
+  python voltvandal.py run --gpu 0 --out artifacts ^
+    --mode vlock --target-voltage-mv 987 --step-mhz 5 --step-mv 5 ^
+    --stress-seconds 120 --max-steps 30 ^
+    --doloming .\doloMing\stress.py --doloming-mode frequency-max
+
+  # Multi-mode sweep: 30s of ray + matrix + frequency-max at each step
+  python voltvandal.py run --gpu 0 --out artifacts ^
+    --mode uv --bin-min-mv 850 --bin-max-mv 950 --step-mv 5 ^
+    --doloming .\doloMing\stress.py --doloming-modes ray,matrix,frequency-max --multi-stress-seconds 30
+
   # Resume from checkpoint
   python voltvandal.py resume --out artifacts
 
@@ -137,6 +148,10 @@ class SessionState:
     power_limit_w: float
     abort_on_throttle: bool
 
+    # multi-mode stress (runs each doloMing mode in sequence per step)
+    doloming_modes: str = ""          # comma-separated modes, e.g. "ray,matrix,frequency-max"; empty = use doloming_mode
+    multi_stress_seconds: int = 30    # per-mode duration when doloming_modes is set
+
     # progress
     current_step: int = 0
     stress_timeout: Optional[int] = None  # hard wall-clock cap on each stress run (seconds)
@@ -147,6 +162,12 @@ class SessionState:
     hybrid_phase: str = "uv"           # "uv" or "oc"
     hybrid_locked_mv: int = 0          # UV offset locked after phase 1
     hybrid_oc_start_step: int = 0      # step number where OC phase began
+
+    # vlock mode state (survives resume)
+    vlock_target_mv: int = 0           # user-supplied anchor voltage
+    vlock_anchor_freq_khz: int = 0     # peak freq confirmed stable in phase 1
+    vlock_uv_offset_mv: int = 0        # confirmed UV offset for sub-anchor bins in phase 2
+    vlock_phase: str = "oc"            # "oc" | "uv" | "done"
 
     # bookkeeping
     started_utc: str = ""
@@ -269,6 +290,32 @@ def apply_offsets_to_bin(
             new_points.append(CurvePoint(p.voltage_uv, p.freq_khz))
 
     return new_points
+
+
+def _build_vlock_curve(
+    stock_points: List[CurvePoint],
+    anchor_idx: int,
+    anchor_voltage_uv: int,
+    anchor_freq_khz: int,
+    uv_offset_uv: int,
+) -> List[CurvePoint]:
+    """
+    Build a candidate VF curve for vlock mode.
+
+    Layout:
+      - Index < anchor_idx  : voltage reduced by uv_offset_uv, freq unchanged (stock)
+      - Index == anchor_idx : fixed at (anchor_voltage_uv, anchor_freq_khz)
+      - Index > anchor_idx  : stock (high-voltage / plateau bins left alone)
+    """
+    out: List[CurvePoint] = []
+    for i, p in enumerate(stock_points):
+        if i < anchor_idx:
+            out.append(CurvePoint(max(p.voltage_uv - uv_offset_uv, 0), p.freq_khz))
+        elif i == anchor_idx:
+            out.append(CurvePoint(anchor_voltage_uv, anchor_freq_khz))
+        else:
+            out.append(CurvePoint(p.voltage_uv, p.freq_khz))
+    return out
 
 
 # ----------------------------
@@ -561,7 +608,7 @@ class NvmlMonitor:
         self.thread: Optional[threading.Thread] = None
 
         self.max_temp: Optional[int] = None
-        self.max_hotspot: Optional[int] = None
+        self.max_hotspot: Optional[float] = None
         self.max_power: Optional[float] = None
         self.any_throttle: bool = False
         self.last_snapshot: Optional[MonitorSnapshot] = None
@@ -757,43 +804,53 @@ def evaluate_candidate(
     stress_exit_codes = {}
 
     if state.doloming:
-        dololog = logs_dir / f"{candidate_label}_doloming_{state.doloming_mode}.log"
-        rc, out_text = run_doloming(
-            state.doloming,
-            state.doloming_mode,
-            state.stress_seconds,
-            None,
-            dololog,
-            abort_event,
-            stress_timeout=state.stress_timeout,
-        )
-        stress_exit_codes["doloming"] = rc
-        if rc != 0:
-            if monitor:
-                monitor.stop()
-            return CandidateResult(
-                False,
-                f"DOLOMING_RC_{rc}",
-                monitor.max_temp if monitor else None,
-                monitor.max_power if monitor else None,
-                monitor.any_throttle if monitor else None,
-                stress_exit_codes,
+        # Multi-mode: run each mode in sequence for multi_stress_seconds each.
+        # Single-mode: run doloming_mode for the full stress_seconds.
+        _modes_raw = (state.doloming_modes or "").strip()
+        _multi_modes = [m.strip() for m in _modes_raw.split(",") if m.strip()] if _modes_raw else []
+        _use_multi = bool(_multi_modes)
+        _run_modes = _multi_modes if _use_multi else [state.doloming_mode]
+        _secs_each = state.multi_stress_seconds if _use_multi else state.stress_seconds
+
+        for _mode in _run_modes:
+            dololog = logs_dir / f"{candidate_label}_doloming_{_mode}.log"
+            rc, out_text = run_doloming(
+                state.doloming,
+                _mode,
+                _secs_each,
+                None,
+                dololog,
+                abort_event,
+                stress_timeout=state.stress_timeout,
             )
-        # Deliberately narrow: "no errors" and "error code: 0" must not trigger.
-        # Match "oom", "out of memory", "failed", or "errors:" followed by a non-zero digit.
-        if re.search(
-            r"\boom\b|\bout of memory\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I
-        ):
-            if monitor:
-                monitor.stop()
-            return CandidateResult(
-                False,
-                "DOLOMING_OUTPUT_ERROR_KEYWORD",
-                monitor.max_temp if monitor else None,
-                monitor.max_power if monitor else None,
-                monitor.any_throttle if monitor else None,
-                stress_exit_codes,
-            )
+            _key = f"doloming_{_mode}" if _use_multi else "doloming"
+            stress_exit_codes[_key] = rc
+            if rc != 0:
+                if monitor:
+                    monitor.stop()
+                return CandidateResult(
+                    False,
+                    f"DOLOMING_{_mode.upper().replace('-', '_')}_RC_{rc}",
+                    monitor.max_temp if monitor else None,
+                    monitor.max_power if monitor else None,
+                    monitor.any_throttle if monitor else None,
+                    stress_exit_codes,
+                )
+            # Deliberately narrow: "no errors" and "error code: 0" must not trigger.
+            # Match "oom", "out of memory", "failed", or "errors:" followed by a non-zero digit.
+            if re.search(
+                r"\boom\b|\bout of memory\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I
+            ):
+                if monitor:
+                    monitor.stop()
+                return CandidateResult(
+                    False,
+                    f"DOLOMING_{_mode.upper().replace('-', '_')}_OUTPUT_ERROR_KEYWORD",
+                    monitor.max_temp if monitor else None,
+                    monitor.max_power if monitor else None,
+                    monitor.any_throttle if monitor else None,
+                    stress_exit_codes,
+                )
 
     if state.gpuburn:
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
@@ -818,7 +875,7 @@ def evaluate_candidate(
                 monitor.stop()
             return CandidateResult(
                 False,
-                "GPUBURN_UNCONFIRMED_ZERO_ERRORS",
+                "GPUBURN_ERRORS_DETECTED",
                 monitor.max_temp if monitor else None,
                 monitor.max_power if monitor else None,
                 monitor.any_throttle if monitor else None,
@@ -861,6 +918,255 @@ def evaluate_candidate(
 
 def revert_to_last_good(state: SessionState) -> None:
     nvapi_apply_curve(state.nvapi_cmd, state.gpu, Path(state.last_good_curve_csv))
+
+
+# ----------------------------
+# vlock tuning loop
+# ----------------------------
+def run_vlock_session(state: SessionState) -> None:
+    """
+    Voltage-lock mode — two-phase automated curve finder.
+
+    Phase 1 (OC): At the user's chosen voltage bin, step frequency up from
+                  stock in +step_mhz increments until the stress test fails.
+                  The last passing frequency becomes the anchor.
+
+    Phase 2 (UV): With the anchor fixed at (anchor_v, peak_f), reduce the
+                  voltage of every bin BELOW the anchor by step_mv per round.
+                  Tests the whole sub-anchor range at once each round — stops
+                  when it fails, backs off one step.
+
+    Produces a curve that:
+      - Maximises clock speed at the chosen voltage (anchor point)
+      - Minimises voltage for all lower-frequency bins (sub-anchor range)
+    This matches the classic MSI Afterburner undervolt shape.
+    """
+    out_dir = Path(state.out_dir)
+    ensure_dir(out_dir)
+    last_good_csv = Path(state.last_good_curve_csv)
+    stock_points = load_curve_csv(Path(state.stock_curve_csv))
+
+    target_uv = mv_to_uv(state.vlock_target_mv)
+
+    # Find the stock-curve bin whose voltage is closest to the target.
+    anchor_idx = min(
+        range(len(stock_points)),
+        key=lambda i: abs(stock_points[i].voltage_uv - target_uv),
+    )
+    anchor_v_uv = stock_points[anchor_idx].voltage_uv   # actual bin voltage
+    anchor_v_mv = anchor_v_uv // 1000
+    anchor_stock_f_khz = stock_points[anchor_idx].freq_khz
+
+    if anchor_v_mv != state.vlock_target_mv:
+        print(
+            f"[vlock] Note: no bin at {state.vlock_target_mv} mV — "
+            f"using nearest bin at {anchor_v_mv} mV."
+        )
+
+    print(
+        f"\n=== VoltVandal — vlock mode ===\n"
+        f"  Anchor voltage : {anchor_v_mv} mV  "
+        f"(stock freq at this bin: {anchor_stock_f_khz // 1000} MHz)\n"
+        f"  Bins below anchor: {anchor_idx}  "
+        f"(indices 0 … {max(anchor_idx - 1, 0)})\n"
+        f"  Resuming at phase : {state.vlock_phase}\n"
+    )
+
+    steps_log = out_dir / "steps.jsonl"
+
+    def _log(result: CandidateResult, label: str, extra: dict) -> None:
+        with steps_log.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps({**asdict(result), "utc": now_utc_iso(),
+                            "label": label, **extra}) + "\n"
+            )
+
+    # ── Phase 1: OC search at anchor voltage ─────────────────────────────────
+    if state.vlock_phase == "oc":
+
+        # Step 0: verify that stock frequency at the target voltage is stable.
+        # This is the minimum bar — if it fails the voltage is simply too low.
+        if state.current_step == 0:
+            cand_pts = _build_vlock_curve(
+                stock_points, anchor_idx, anchor_v_uv, anchor_stock_f_khz, 0
+            )
+            cand_csv = out_dir / "candidate.csv"
+            write_curve_csv(cand_csv, cand_pts)
+            label = f"vlock_oc_step000_{anchor_v_mv}mv_{anchor_stock_f_khz // 1000}mhz_baseline"
+            print(
+                f"\n== {label} ==\n"
+                f"  Verifying stock frequency at anchor voltage before stepping up.\n"
+            )
+            result = evaluate_candidate(state, cand_csv, label)
+            _log(result, label, {"phase": "oc", "anchor_v_mv": anchor_v_mv,
+                                 "freq_khz": anchor_stock_f_khz, "uv_offset_mv": 0})
+            print(f"Result: {'PASS' if result.ok else 'FAIL'} | {result.reason}")
+
+            if not result.ok:
+                revert_to_last_good(state)
+                print(
+                    f"\nFAIL: Stock frequency ({anchor_stock_f_khz // 1000} MHz) is "
+                    f"unstable at {anchor_v_mv} mV.\n"
+                    f"  → Try a higher --target-voltage-mv (e.g. {anchor_v_mv + 13} mV)."
+                )
+                return
+
+            # Baseline passed: record stock freq as current best anchor.
+            state.vlock_anchor_freq_khz = anchor_stock_f_khz
+            shutil.copyfile(cand_csv, last_good_csv)
+            state.current_step = 0   # step 0 done; loop below starts at 1
+            save_session(state)
+
+        # Steps 1+: step frequency up until failure.
+        oc_step = max(state.current_step, 1)
+        while oc_step <= state.max_steps:
+            if _interrupted.is_set():
+                eprint("\nInterrupted — reverting to last known-good curve...")
+                revert_to_last_good(state)
+                raise KeyboardInterrupt("User pressed Ctrl+C")
+
+            freq_khz = anchor_stock_f_khz + mhz_to_khz(state.step_mhz * oc_step)
+            cand_pts = _build_vlock_curve(
+                stock_points, anchor_idx, anchor_v_uv, freq_khz, 0
+            )
+            cand_csv = out_dir / "candidate.csv"
+            write_curve_csv(cand_csv, cand_pts)
+            label = (
+                f"vlock_oc_step{oc_step:03d}_{anchor_v_mv}mv"
+                f"_{freq_khz // 1000}mhz"
+                f"_plus{state.step_mhz * oc_step}mhz"
+            )
+            print(
+                f"\n== Phase 1 — {label} ==\n"
+                f"  Anchor: {anchor_v_mv} mV  @  {freq_khz // 1000} MHz  "
+                f"(+{state.step_mhz * oc_step} MHz vs stock)\n"
+                f"  Stress: {state.stress_seconds}s\n"
+            )
+
+            result = evaluate_candidate(state, cand_csv, label)
+            _log(result, label, {"phase": "oc", "anchor_v_mv": anchor_v_mv,
+                                 "freq_khz": freq_khz,
+                                 "delta_mhz": state.step_mhz * oc_step,
+                                 "uv_offset_mv": 0})
+            print(f"Result: {'PASS' if result.ok else 'FAIL'} | {result.reason}")
+
+            if result.ok:
+                state.vlock_anchor_freq_khz = freq_khz
+                shutil.copyfile(cand_csv, last_good_csv)
+                state.current_step = oc_step
+                save_session(state)
+                oc_step += 1
+            else:
+                revert_to_last_good(state)
+                print(
+                    f"\n== Phase 1 complete ==\n"
+                    f"  Anchor locked: {anchor_v_mv} mV  @  "
+                    f"{state.vlock_anchor_freq_khz // 1000} MHz  "
+                    f"(failed at {freq_khz // 1000} MHz)\n"
+                    f"  Switching to Phase 2: UV sweep below anchor...\n"
+                )
+                state.vlock_phase = "uv"
+                state.current_step = 0
+                save_session(state)
+                break
+        else:
+            print(
+                f"Phase 1 max steps reached — anchor at "
+                f"{state.vlock_anchor_freq_khz // 1000} MHz. Moving to Phase 2."
+            )
+            state.vlock_phase = "uv"
+            state.current_step = 0
+            save_session(state)
+
+    # ── Phase 2: UV sweep below anchor ───────────────────────────────────────
+    if state.vlock_phase == "uv":
+        if state.vlock_anchor_freq_khz == 0:
+            state.vlock_anchor_freq_khz = anchor_stock_f_khz   # safety fallback
+
+        if anchor_idx == 0:
+            print("Anchor is the lowest voltage bin — no bins to undervolt. Done.")
+            state.vlock_phase = "done"
+            save_session(state)
+        else:
+            print(
+                f"\nPhase 2 (UV sweep): reducing voltage of {anchor_idx} bin(s) "
+                f"below anchor ({anchor_v_mv} mV @ "
+                f"{state.vlock_anchor_freq_khz // 1000} MHz)\n"
+                f"  Each round: all sub-anchor bins reduced by {state.step_mv} mV\n"
+            )
+
+            uv_step = state.current_step + 1
+            while uv_step <= state.max_steps:
+                if _interrupted.is_set():
+                    eprint("\nInterrupted — reverting to last known-good curve...")
+                    revert_to_last_good(state)
+                    raise KeyboardInterrupt("User pressed Ctrl+C")
+
+                uv_offset_mv = state.step_mv * uv_step
+                uv_offset_uv = mv_to_uv(uv_offset_mv)
+                cand_pts = _build_vlock_curve(
+                    stock_points, anchor_idx, anchor_v_uv,
+                    state.vlock_anchor_freq_khz, uv_offset_uv,
+                )
+                cand_csv = out_dir / "candidate.csv"
+                write_curve_csv(cand_csv, cand_pts)
+                label = (
+                    f"vlock_uv_step{uv_step:03d}"
+                    f"_minus{uv_offset_mv}mv_below_anchor"
+                )
+                print(
+                    f"\n== Phase 2 — {label} ==\n"
+                    f"  Anchor: {anchor_v_mv} mV  @  "
+                    f"{state.vlock_anchor_freq_khz // 1000} MHz  (locked)\n"
+                    f"  Sub-anchor bins: −{uv_offset_mv} mV on {anchor_idx} bin(s)\n"
+                    f"  Stress: {state.stress_seconds}s\n"
+                )
+
+                result = evaluate_candidate(state, cand_csv, label)
+                _log(result, label, {"phase": "uv", "anchor_v_mv": anchor_v_mv,
+                                     "anchor_freq_khz": state.vlock_anchor_freq_khz,
+                                     "uv_offset_mv": uv_offset_mv})
+                print(f"Result: {'PASS' if result.ok else 'FAIL'} | {result.reason}")
+
+                if result.ok:
+                    state.vlock_uv_offset_mv = uv_offset_mv
+                    shutil.copyfile(cand_csv, last_good_csv)
+                    state.current_step = uv_step
+                    save_session(state)
+                    uv_step += 1
+                else:
+                    revert_to_last_good(state)
+                    print(
+                        f"\n== Phase 2 complete ==\n"
+                        f"  Max UV offset for sub-anchor bins: "
+                        f"−{state.vlock_uv_offset_mv} mV  "
+                        f"(failed at −{uv_offset_mv} mV)\n"
+                    )
+                    state.vlock_phase = "done"
+                    save_session(state)
+                    break
+            else:
+                print(
+                    f"Phase 2 max steps reached — "
+                    f"UV offset: {state.vlock_uv_offset_mv} mV"
+                )
+                state.vlock_phase = "done"
+                save_session(state)
+
+    # ── Final summary ─────────────────────────────────────────────────────────
+    if state.vlock_phase == "done":
+        print(
+            f"\n{'=' * 52}\n"
+            f"  vlock optimisation complete\n"
+            f"{'=' * 52}\n"
+            f"  Anchor  :  {anchor_v_mv} mV  @  "
+            f"{state.vlock_anchor_freq_khz // 1000} MHz\n"
+            f"  UV gain :  −{state.vlock_uv_offset_mv} mV on "
+            f"{anchor_idx} sub-anchor bin(s)\n"
+            f"  Curve   :  {last_good_csv}\n"
+            f"\n  To apply on next boot:\n"
+            f"    python voltvandal.py restore --out {state.out_dir}\n"
+        )
 
 
 # ----------------------------
@@ -1074,6 +1380,8 @@ def build_session_from_args(args: argparse.Namespace) -> SessionState:
         stress_seconds=args.stress_seconds,
         doloming=args.doloming,
         doloming_mode=args.doloming_mode,
+        doloming_modes=getattr(args, "doloming_modes", ""),
+        multi_stress_seconds=getattr(args, "multi_stress_seconds", 30),
         gpuburn=args.gpuburn,
         stress_timeout=getattr(args, "stress_timeout", None),
         poll_seconds=args.poll_seconds,
@@ -1085,22 +1393,34 @@ def build_session_from_args(args: argparse.Namespace) -> SessionState:
         current_step=0,
         current_offset_mv=0,
         current_offset_mhz=0,
+        vlock_target_mv=getattr(args, "target_voltage_mv", 0),
+        vlock_anchor_freq_khz=0,
+        vlock_uv_offset_mv=0,
+        vlock_phase="oc",
         started_utc=now_utc_iso(),
         updated_utc=now_utc_iso(),
     )
+
+
+def _dispatch_session(state: SessionState) -> None:
+    """Route to the correct tuning loop based on session mode."""
+    if state.mode == "vlock":
+        run_vlock_session(state)
+    else:
+        run_session(state)
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     state = build_session_from_args(args)
     save_session(state)
     print(f"Wrote session checkpoint: {state.checkpoint_json}")
-    run_session(state)
+    _dispatch_session(state)
 
 
 def cmd_resume(args: argparse.Namespace) -> None:
     state = load_session(Path(args.out))
     print(f"Loaded session: {state.checkpoint_json}")
-    run_session(state)
+    _dispatch_session(state)
 
 
 def cmd_restore(args: argparse.Namespace) -> None:
@@ -1112,6 +1432,113 @@ def cmd_restore(args: argparse.Namespace) -> None:
     print(f"Applying curve: {curve}")
     nvapi_apply_curve(args.nvapi_cmd, args.gpu, curve)
     print("Done.")
+
+
+# ----------------------------
+# Startup persistence (Windows Task Scheduler)
+# ----------------------------
+_STARTUP_TASK_PREFIX = "VoltVandal-RestoreCurve"
+
+
+def _startup_task_name(gpu: int) -> str:
+    return f"{_STARTUP_TASK_PREFIX}-GPU{gpu}"
+
+
+def _run_powershell(script: str) -> "subprocess.CompletedProcess[str]":
+    """Run a PowerShell script via -EncodedCommand to avoid shell-quoting issues."""
+    import base64
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        capture_output=True,
+        text=True,
+    )
+
+
+def cmd_register_startup(args: argparse.Namespace) -> None:
+    """Register a Windows Task Scheduler logon task to restore the last-good curve."""
+    if not is_windows():
+        eprint("ERROR: register-startup is Windows-only (uses Task Scheduler).")
+        raise SystemExit(1)
+
+    script_path = Path(__file__).resolve()
+    python_exe = Path(sys.executable).resolve()
+    out_dir = Path(args.out).resolve()
+    delay = args.startup_delay
+    task = _startup_task_name(args.gpu)
+
+    if not out_dir.exists():
+        eprint(f"WARNING: --out directory does not exist yet: {out_dir}")
+        eprint("         The task will fail at logon until a tuning session writes last_good_curve.csv.")
+
+    def _q(s: object) -> str:
+        """Escape a value for use inside a PowerShell single-quoted string."""
+        return str(s).replace("'", "''")
+
+    ps = f"""$action = New-ScheduledTaskAction `
+    -Execute '{_q(python_exe)}' `
+    -Argument '"{_q(script_path)}" restore --gpu {args.gpu} --out "{_q(out_dir)}"' `
+    -WorkingDirectory '{_q(script_path.parent)}'
+
+$trigger = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+$trigger.Delay = 'PT{delay}S'
+
+$settings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+    -MultipleInstances IgnoreNew `
+    -Hidden $true
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "$env:USERDOMAIN\\$env:USERNAME" `
+    -LogonType Interactive `
+    -RunLevel Highest
+
+Register-ScheduledTask `
+    -TaskName '{_q(task)}' `
+    -Action   $action `
+    -Trigger  $trigger `
+    -Settings $settings `
+    -Principal $principal `
+    -Description 'VoltVandal: restore last-good VF curve {delay}s after logon (GPU {args.gpu})' `
+    -Force | Out-Null
+Write-Output 'REGISTERED'"""
+
+    cp = _run_powershell(ps)
+    if cp.returncode != 0 or "REGISTERED" not in cp.stdout:
+        eprint("ERROR: Failed to register startup task.")
+        eprint(cp.stderr.strip() or cp.stdout.strip())
+        raise SystemExit(1)
+
+    curve_path = out_dir / "last_good_curve.csv"
+    print(f"Startup task registered: {task}")
+    print(f"  Trigger  : logon  +{delay}s delay  (elevated / RunLevel Highest)")
+    print(f"  Curve    : {curve_path}")
+    print(f"  GPU      : {args.gpu}")
+    print(f'\nVerify : schtasks /query /tn "{task}" /fo list')
+    print(f"Remove : python voltvandal.py unregister-startup --gpu {args.gpu}")
+
+
+def cmd_unregister_startup(args: argparse.Namespace) -> None:
+    """Remove the VoltVandal logon startup task from Windows Task Scheduler."""
+    if not is_windows():
+        eprint("ERROR: unregister-startup is Windows-only.")
+        raise SystemExit(1)
+
+    task = _startup_task_name(args.gpu)
+
+    def _q(s: object) -> str:
+        return str(s).replace("'", "''")
+
+    ps = f"""Unregister-ScheduledTask -TaskName '{_q(task)}' -Confirm:$false -ErrorAction Stop
+Write-Output 'REMOVED'"""
+
+    cp = _run_powershell(ps)
+    if cp.returncode != 0 or "REMOVED" not in cp.stdout:
+        eprint(f"ERROR: Failed to remove task '{task}'.")
+        eprint(cp.stderr.strip() or cp.stdout.strip())
+        raise SystemExit(1)
+
+    print(f"Startup task removed: {task}")
 
 
 # ----------------------------
@@ -1143,7 +1570,7 @@ def parse_args() -> argparse.Namespace:
     sp = sub.add_parser(
         "run", parents=[common], help="Start a new session and run tuning steps."
     )
-    sp.add_argument("--mode", choices=["uv", "oc", "hybrid"], default="uv")
+    sp.add_argument("--mode", choices=["uv", "oc", "hybrid", "vlock"], default="uv")
     sp.add_argument(
         "--bin-min-mv", type=int, default=850, help="Min mV for affected voltage bin"
     )
@@ -1187,6 +1614,24 @@ def parse_args() -> argparse.Namespace:
         help="doloMing mode (e.g. frequency-max/ray/matrix). Default frequency-max",
     )
     sp.add_argument(
+        "--doloming-modes",
+        dest="doloming_modes",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated doloMing modes to run in sequence per step "
+            "(e.g. 'ray,matrix,frequency-max'). When set, overrides --doloming-mode "
+            "and uses --multi-stress-seconds for per-mode duration."
+        ),
+    )
+    sp.add_argument(
+        "--multi-stress-seconds",
+        dest="multi_stress_seconds",
+        type=int,
+        default=30,
+        help="Per-mode duration (seconds) when --doloming-modes is used. Default 30",
+    )
+    sp.add_argument(
         "--gpuburn", type=str, default=None, help="Path to gpu-burn exe (optional)"
     )
     sp.add_argument(
@@ -1224,6 +1669,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Abort if any throttle reason is nonzero",
     )
+    sp.add_argument(
+        "--target-voltage-mv",
+        dest="target_voltage_mv",
+        type=int,
+        default=0,
+        help=(
+            "[vlock mode] Voltage (mV) to use as the curve anchor. "
+            "The nearest stock-curve bin is selected automatically. "
+            "Required when --mode vlock. Example: --target-voltage-mv 987"
+        ),
+    )
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser(
@@ -1243,6 +1699,29 @@ def parse_args() -> argparse.Namespace:
         help="Curve csv to apply (default: last_good_curve.csv in --out)",
     )
     sp.set_defaults(func=cmd_restore)
+
+    sp = sub.add_parser(
+        "register-startup",
+        help="Register a logon task that auto-applies the last-good curve on boot (Windows only).",
+    )
+    sp.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
+    sp.add_argument("--out", required=True, help="Artifacts folder containing last_good_curve.csv")
+    sp.add_argument(
+        "--startup-delay",
+        dest="startup_delay",
+        type=int,
+        default=15,
+        metavar="SECONDS",
+        help="Seconds to wait after logon before applying the curve (default: 15).",
+    )
+    sp.set_defaults(func=cmd_register_startup)
+
+    sp = sub.add_parser(
+        "unregister-startup",
+        help="Remove the VoltVandal logon startup task (Windows only).",
+    )
+    sp.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
+    sp.set_defaults(func=cmd_unregister_startup)
 
     return p.parse_args()
 
@@ -1283,7 +1762,11 @@ def main() -> int:
         if args.gpuburn and not Path(args.gpuburn).exists():
             eprint(f"ERROR: gpu-burn path not found: {args.gpuburn}")
             return 2
-        if args.bin_min_mv > args.bin_max_mv:
+        if args.mode == "vlock":
+            if not getattr(args, "target_voltage_mv", 0):
+                eprint("ERROR: --mode vlock requires --target-voltage-mv <mV>")
+                return 2
+        if args.mode != "vlock" and args.bin_min_mv > args.bin_max_mv:
             eprint("ERROR: bin-min-mv must be <= bin-max-mv")
             return 2
         if args.max_steps <= 0:
