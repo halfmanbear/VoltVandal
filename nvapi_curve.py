@@ -48,6 +48,7 @@ _ID_GetClockBoostMask  = 0x507B4B59
 _ID_GetVFPCurve        = 0x21537AD4
 _ID_GetClockBoostTable = 0x23F1B133
 _ID_SetClockBoostTable = 0x0733E009
+_ID_GetThermalSensors  = 0x65FE3AAD
 
 # ── struct definitions (mirrors nvapi-cmd.cpp exactly) ────────────────────────
 
@@ -122,6 +123,26 @@ class _NV_GPU_CLOCK_TABLE(ctypes.Structure):
         ("mask",     ctypes.c_uint8 * 32),
         ("unknown1", ctypes.c_uint8 * 32),
         ("clocks",   _TableEntry * 255),
+    ]
+
+
+class _NV_GPU_THERMAL_SENSORS(ctypes.Structure):
+    """
+    Undocumented NvAPI struct for GPU thermal sensors.
+    Discovered via LibreHardwareMonitor (NvApi.cs).
+    Pack=8, version=2.  Temperatures are fixed-point: value / 256.0 = °C.
+
+    Sensor indices (Ampere / RTX 30xx):
+      [0] = GPU edge (same as NVML TEMPERATURE_GPU)
+      [1] = GPU hotspot / junction
+      [9] = VRAM junction temperature
+    """
+    _pack_ = 8
+    _fields_ = [
+        ("version",      ctypes.c_uint32),
+        ("mask",         ctypes.c_uint32),
+        ("reserved",     ctypes.c_int32 * 8),
+        ("temperatures", ctypes.c_int32 * 32),
     ]
 
 
@@ -305,7 +326,78 @@ def _reset_curve(handle: int) -> None:
     _set_clock_table(handle, table)
 
 
+def _probe_thermal_mask(handle: int) -> int:
+    """Probe which thermal sensor bits are supported by trying each one."""
+    f = _qif(
+        _ID_GetThermalSensors,
+        ctypes.c_int,
+        [ctypes.c_void_p, ctypes.POINTER(_NV_GPU_THERMAL_SENSORS)],
+    )
+    mask = 0
+    for bit in range(32):
+        sensors = _NV_GPU_THERMAL_SENSORS()
+        sensors.version = ctypes.sizeof(sensors) | (2 << 16)
+        sensors.mask = 1 << bit
+        rc = f(ctypes.c_void_p(handle), ctypes.byref(sensors))
+        if rc != 0:
+            break
+        mask |= 1 << bit
+    return mask
+
+
 # ── public API ────────────────────────────────────────────────────────────────
+
+_thermal_mask_cache: dict[int, int] = {}
+
+
+def get_thermal_sensors(gpu_index: int) -> dict[str, float | None]:
+    """
+    Read GPU thermal sensors via undocumented NvAPI_GPU_ThermalGetSensors.
+
+    Returns a dict with keys:
+        "gpu_edge_c"       — GPU edge temp (°C) or None
+        "hotspot_c"        — GPU hotspot / junction temp (°C) or None
+        "vram_junction_c"  — VRAM junction temp (°C) or None
+
+    Raises RuntimeError if NvAPI call fails entirely.
+    Returns None values for sensors that aren't populated.
+    """
+    _nvapi_init()
+    handle = _get_handle(gpu_index)
+
+    # Probe and cache the supported sensor mask
+    if handle not in _thermal_mask_cache:
+        _thermal_mask_cache[handle] = _probe_thermal_mask(handle)
+    mask = _thermal_mask_cache[handle]
+
+    if mask == 0:
+        return {"gpu_edge_c": None, "hotspot_c": None, "vram_junction_c": None}
+
+    sensors = _NV_GPU_THERMAL_SENSORS()
+    sensors.version = ctypes.sizeof(sensors) | (2 << 16)
+    sensors.mask = mask
+
+    f = _qif(
+        _ID_GetThermalSensors,
+        ctypes.c_int,
+        [ctypes.c_void_p, ctypes.POINTER(_NV_GPU_THERMAL_SENSORS)],
+    )
+    rc = f(ctypes.c_void_p(handle), ctypes.byref(sensors))
+    if rc != 0:
+        raise RuntimeError(f"NvAPI_GPU_GetThermalSensors failed: {rc:#010x}")
+
+    def _read(idx: int) -> float | None:
+        raw = sensors.temperatures[idx]
+        if raw == 0:
+            return None
+        return raw / 256.0
+
+    return {
+        "gpu_edge_c": _read(0),
+        "hotspot_c": _read(1),
+        "vram_junction_c": _read(9),  # index 9 for Ampere (RTX 30xx)
+    }
+
 
 def dump_curve(gpu_index: int, out_csv: "str | Path") -> None:
     """
