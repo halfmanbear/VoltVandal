@@ -45,6 +45,11 @@ Typical usage:
     --stress-seconds 120 --max-steps 30 ^
     --doloming .\doloMing\stress.py --doloming-mode frequency-max
 
+  # Multi-mode sweep: 30s of ray + matrix + frequency-max at each step
+  python voltvandal.py run --gpu 0 --out artifacts ^
+    --mode uv --bin-min-mv 850 --bin-max-mv 950 --step-mv 5 ^
+    --doloming .\doloMing\stress.py --doloming-modes ray,matrix,frequency-max --multi-stress-seconds 30
+
   # Resume from checkpoint
   python voltvandal.py resume --out artifacts
 
@@ -142,6 +147,10 @@ class SessionState:
     hotspot_offset_c: int
     power_limit_w: float
     abort_on_throttle: bool
+
+    # multi-mode stress (runs each doloMing mode in sequence per step)
+    doloming_modes: str = ""          # comma-separated modes, e.g. "ray,matrix,frequency-max"; empty = use doloming_mode
+    multi_stress_seconds: int = 30    # per-mode duration when doloming_modes is set
 
     # progress
     current_step: int = 0
@@ -795,43 +804,53 @@ def evaluate_candidate(
     stress_exit_codes = {}
 
     if state.doloming:
-        dololog = logs_dir / f"{candidate_label}_doloming_{state.doloming_mode}.log"
-        rc, out_text = run_doloming(
-            state.doloming,
-            state.doloming_mode,
-            state.stress_seconds,
-            None,
-            dololog,
-            abort_event,
-            stress_timeout=state.stress_timeout,
-        )
-        stress_exit_codes["doloming"] = rc
-        if rc != 0:
-            if monitor:
-                monitor.stop()
-            return CandidateResult(
-                False,
-                f"DOLOMING_RC_{rc}",
-                monitor.max_temp if monitor else None,
-                monitor.max_power if monitor else None,
-                monitor.any_throttle if monitor else None,
-                stress_exit_codes,
+        # Multi-mode: run each mode in sequence for multi_stress_seconds each.
+        # Single-mode: run doloming_mode for the full stress_seconds.
+        _modes_raw = (state.doloming_modes or "").strip()
+        _multi_modes = [m.strip() for m in _modes_raw.split(",") if m.strip()] if _modes_raw else []
+        _use_multi = bool(_multi_modes)
+        _run_modes = _multi_modes if _use_multi else [state.doloming_mode]
+        _secs_each = state.multi_stress_seconds if _use_multi else state.stress_seconds
+
+        for _mode in _run_modes:
+            dololog = logs_dir / f"{candidate_label}_doloming_{_mode}.log"
+            rc, out_text = run_doloming(
+                state.doloming,
+                _mode,
+                _secs_each,
+                None,
+                dololog,
+                abort_event,
+                stress_timeout=state.stress_timeout,
             )
-        # Deliberately narrow: "no errors" and "error code: 0" must not trigger.
-        # Match "oom", "out of memory", "failed", or "errors:" followed by a non-zero digit.
-        if re.search(
-            r"\boom\b|\bout of memory\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I
-        ):
-            if monitor:
-                monitor.stop()
-            return CandidateResult(
-                False,
-                "DOLOMING_OUTPUT_ERROR_KEYWORD",
-                monitor.max_temp if monitor else None,
-                monitor.max_power if monitor else None,
-                monitor.any_throttle if monitor else None,
-                stress_exit_codes,
-            )
+            _key = f"doloming_{_mode}" if _use_multi else "doloming"
+            stress_exit_codes[_key] = rc
+            if rc != 0:
+                if monitor:
+                    monitor.stop()
+                return CandidateResult(
+                    False,
+                    f"DOLOMING_{_mode.upper().replace('-', '_')}_RC_{rc}",
+                    monitor.max_temp if monitor else None,
+                    monitor.max_power if monitor else None,
+                    monitor.any_throttle if monitor else None,
+                    stress_exit_codes,
+                )
+            # Deliberately narrow: "no errors" and "error code: 0" must not trigger.
+            # Match "oom", "out of memory", "failed", or "errors:" followed by a non-zero digit.
+            if re.search(
+                r"\boom\b|\bout of memory\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I
+            ):
+                if monitor:
+                    monitor.stop()
+                return CandidateResult(
+                    False,
+                    f"DOLOMING_{_mode.upper().replace('-', '_')}_OUTPUT_ERROR_KEYWORD",
+                    monitor.max_temp if monitor else None,
+                    monitor.max_power if monitor else None,
+                    monitor.any_throttle if monitor else None,
+                    stress_exit_codes,
+                )
 
     if state.gpuburn:
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
@@ -1361,6 +1380,8 @@ def build_session_from_args(args: argparse.Namespace) -> SessionState:
         stress_seconds=args.stress_seconds,
         doloming=args.doloming,
         doloming_mode=args.doloming_mode,
+        doloming_modes=getattr(args, "doloming_modes", ""),
+        multi_stress_seconds=getattr(args, "multi_stress_seconds", 30),
         gpuburn=args.gpuburn,
         stress_timeout=getattr(args, "stress_timeout", None),
         poll_seconds=args.poll_seconds,
@@ -1484,6 +1505,24 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="frequency-max",
         help="doloMing mode (e.g. frequency-max/ray/matrix). Default frequency-max",
+    )
+    sp.add_argument(
+        "--doloming-modes",
+        dest="doloming_modes",
+        type=str,
+        default="",
+        help=(
+            "Comma-separated doloMing modes to run in sequence per step "
+            "(e.g. 'ray,matrix,frequency-max'). When set, overrides --doloming-mode "
+            "and uses --multi-stress-seconds for per-mode duration."
+        ),
+    )
+    sp.add_argument(
+        "--multi-stress-seconds",
+        dest="multi_stress_seconds",
+        type=int,
+        default=30,
+        help="Per-mode duration (seconds) when --doloming-modes is used. Default 30",
     )
     sp.add_argument(
         "--gpuburn", type=str, default=None, help="Path to gpu-burn exe (optional)"
