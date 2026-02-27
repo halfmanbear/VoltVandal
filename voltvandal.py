@@ -122,6 +122,7 @@ class SessionState:
 
     # progress
     current_step: int = 0
+    stress_timeout: Optional[int] = None  # hard wall-clock cap on each stress run (seconds)
     current_offset_mv: int = 0
     current_offset_mhz: int = 0
 
@@ -145,6 +146,27 @@ def is_windows() -> bool:
     return os.name == "nt"
 
 
+def warn_if_not_admin() -> None:
+    """On Windows, emit a warning when the process is not elevated.
+
+    nvapi-cmd.exe typically requires Administrator rights.  A missing privilege
+    will produce a confusing access-denied error deep in the run; better to
+    surface it immediately.
+    """
+    if not is_windows():
+        return
+    try:
+        import ctypes
+        if not ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined]
+            eprint(
+                "WARNING: Not running as Administrator. "
+                "nvapi-cmd.exe usually requires elevated privileges. "
+                "Re-run from an elevated terminal if commands fail."
+            )
+    except Exception:
+        pass  # can't determine; continue anyway
+
+
 def eprint(*args, **kwargs) -> None:
     print(*args, file=sys.stderr, **kwargs)
 
@@ -158,14 +180,18 @@ def load_curve_csv(path: Path) -> List[CurvePoint]:
         reader = csv.DictReader(f)
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header: {path}")
-        required = {"voltageUV", "frequencyKHz"}
-        if not required.issubset(set(reader.fieldnames)):
+        # Normalise header names to lowercase for case-insensitive matching.
+        norm = {name.lower(): name for name in reader.fieldnames}
+        required_lower = {"voltageuv", "frequencykhz"}
+        if not required_lower.issubset(set(norm.keys())):
             raise ValueError(
-                f"CSV header must include {required}, got {reader.fieldnames}"
+                f"CSV header must include voltageUV and frequencyKHz (case-insensitive), got {reader.fieldnames}"
             )
+        col_v = norm["voltageuv"]
+        col_f = norm["frequencykhz"]
         for row in reader:
-            v = int(row["voltageUV"])
-            fk = int(row["frequencyKHz"])
+            v = int(row[col_v])
+            fk = int(row[col_f])
             points.append(CurvePoint(voltage_uv=v, freq_khz=fk))
     if not points:
         raise ValueError(f"No curve points loaded from {path}")
@@ -243,9 +269,12 @@ def run_cmd(
     )
 
 
+_NVAPI_TIMEOUT_S = 30  # seconds before nvapi-cmd.exe is considered hung
+
+
 def nvapi_dump_curve(nvapi_cmd: str, gpu: int, out_csv: Path) -> None:
     cmd = [nvapi_cmd, "-curve", str(gpu), "-1", str(out_csv)]
-    cp = run_cmd(cmd, capture=True)
+    cp = run_cmd(cmd, capture=True, timeout=_NVAPI_TIMEOUT_S)
     if cp.returncode != 0:
         raise RuntimeError(
             f"nvapi-cmd dump failed rc={cp.returncode}\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
@@ -256,7 +285,7 @@ def nvapi_dump_curve(nvapi_cmd: str, gpu: int, out_csv: Path) -> None:
 
 def nvapi_apply_curve(nvapi_cmd: str, gpu: int, in_csv: Path) -> None:
     cmd = [nvapi_cmd, "-curve", str(gpu), "1", str(in_csv)]
-    cp = run_cmd(cmd, capture=True)
+    cp = run_cmd(cmd, capture=True, timeout=_NVAPI_TIMEOUT_S)
     if cp.returncode != 0:
         raise RuntimeError(
             f"nvapi-cmd apply failed rc={cp.returncode}\nSTDOUT:\n{cp.stdout}\nSTDERR:\n{cp.stderr}"
@@ -316,6 +345,7 @@ def run_doloming(
     workdir: Optional[Path],
     log_path: Path,
     abort_event: threading.Event,
+    stress_timeout: Optional[int] = None,
 ) -> Tuple[int, str]:
     exe_is_py = doloming_path.lower().endswith(".py")
     base_cmd = [sys.executable, doloming_path] if exe_is_py else [doloming_path]
@@ -329,11 +359,15 @@ def run_doloming(
     for cmd in candidates:
         p = start_process(cmd, cwd=workdir)
         output_lines: List[str] = []
+        deadline: Optional[float] = time.time() + stress_timeout if stress_timeout else None
         try:
             while True:
                 if abort_event.is_set():
                     terminate_process_tree(p)
                     return (999, "ABORTED_BY_MONITOR")
+                if deadline and time.time() > deadline:
+                    terminate_process_tree(p)
+                    return (998, "STRESS_TIMEOUT")
                 line = p.stdout.readline() if p.stdout else ""
                 if line:
                     output_lines.append(line)
@@ -371,15 +405,20 @@ def run_gpuburn(
     workdir: Optional[Path],
     log_path: Path,
     abort_event: threading.Event,
+    stress_timeout: Optional[int] = None,
 ) -> Tuple[int, str, bool]:
     cmd = [gpuburn_path, str(seconds)]
     p = start_process(cmd, cwd=workdir)
     output_lines: List[str] = []
+    deadline: Optional[float] = time.time() + stress_timeout if stress_timeout else None
     try:
         while True:
             if abort_event.is_set():
                 terminate_process_tree(p)
                 return (999, "ABORTED_BY_MONITOR", False)
+            if deadline and time.time() > deadline:
+                terminate_process_tree(p)
+                return (998, "STRESS_TIMEOUT", False)
             line = p.stdout.readline() if p.stdout else ""
             if line:
                 output_lines.append(line)
@@ -403,8 +442,8 @@ def run_gpuburn(
     if m:
         ok = int(m.group(1)) == 0
     else:
-        # No explicit counter found — conservative default.
-        ok = False
+        # No explicit counter found: treat as ok unless failure keywords are present.
+        ok = True
         if re.search(r"\bfail(ed)?\b|\berror\b", out_text, re.I):
             ok = False
 
@@ -454,7 +493,11 @@ class NvmlMonitor:
         if pynvml is None:
             raise RuntimeError("pynvml not installed. `pip install pynvml`")
         pynvml.nvmlInit()
-        self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+        try:
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+        except Exception:
+            pynvml.nvmlShutdown()
+            raise
 
         first = not self.log_csv.exists()
         with self.log_csv.open("a", newline="") as f:
@@ -532,7 +575,12 @@ class NvmlMonitor:
     def stop(self) -> None:
         self.stop_event.set()
         if self.thread:
-            self.thread.join(timeout=2.0)
+            self.thread.join(timeout=5.0)
+            if self.thread.is_alive():
+                # Thread didn't exit in time; skip nvmlShutdown to avoid calling
+                # NVML from the main thread while the monitor thread may still be using it.
+                eprint("WARNING: monitor thread did not stop within 5s; skipping nvmlShutdown.")
+                return
         try:
             if pynvml is not None:
                 pynvml.nvmlShutdown()
@@ -609,6 +657,7 @@ def evaluate_candidate(
             None,
             dololog,
             abort_event,
+            stress_timeout=state.stress_timeout,
         )
         stress_exit_codes["doloming"] = rc
         if rc != 0:
@@ -622,7 +671,11 @@ def evaluate_candidate(
                 monitor.any_throttle if monitor else None,
                 stress_exit_codes,
             )
-        if re.search(r"\boom\b|\bout of memory\b|\bfail\b|\berror\b", out_text, re.I):
+        # Deliberately narrow: "no errors" and "error code: 0" must not trigger.
+        # Match "oom", "out of memory", "failed", or "errors:" followed by a non-zero digit.
+        if re.search(
+            r"\boom\b|\bout of memory\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I
+        ):
             if monitor:
                 monitor.stop()
             return CandidateResult(
@@ -637,7 +690,8 @@ def evaluate_candidate(
     if state.gpuburn:
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
         rc, out_text, parsed_ok = run_gpuburn(
-            state.gpuburn, state.stress_seconds, None, burnlog, abort_event
+            state.gpuburn, state.stress_seconds, None, burnlog, abort_event,
+            stress_timeout=state.stress_timeout,
         )
         stress_exit_codes["gpuburn"] = rc
         if rc != 0:
@@ -662,7 +716,7 @@ def evaluate_candidate(
                 monitor.any_throttle if monitor else None,
                 stress_exit_codes,
             )
-        if re.search(r"\bnan\b|\bfail\b|\berror\b", out_text, re.I):
+        if re.search(r"\bnan\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I):
             if monitor:
                 monitor.stop()
             return CandidateResult(
@@ -718,6 +772,23 @@ def run_session(state: SessionState) -> None:
         print("Reached max steps. Nothing to do.")
         return
 
+    # Sanity-check: warn if the GPU is already throttling at idle before we begin.
+    if pynvml is not None:
+        try:
+            pynvml.nvmlInit()
+            _h = pynvml.nvmlDeviceGetHandleByIndex(state.gpu)
+            _throttle = int(pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(_h))
+            pynvml.nvmlShutdown()
+            # Bit 0 (GPU idle / clocks optimised) is harmless; anything else is active throttle.
+            _active = _throttle & ~0x1
+            if _active != 0:
+                eprint(
+                    f"WARNING: GPU {state.gpu} is already throttling at baseline "
+                    f"(reasons=0x{_throttle:08x}). Tuning results may be unreliable."
+                )
+        except Exception as _ex:
+            eprint(f"WARNING: Could not read baseline throttle state: {_ex}")
+
     print(
         f"Starting from step {state.current_step}/{state.max_steps} mode={state.mode}"
     )
@@ -772,8 +843,13 @@ def run_session(state: SessionState) -> None:
             )
 
         if result.ok:
+            # Keep a timestamped backup before overwriting last_good_curve.csv.
+            backups_dir = out_dir / "curve_backups"
+            ensure_dir(backups_dir)
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+            shutil.copyfile(candidate_csv, backups_dir / f"good_{label}_{ts}.csv")
             shutil.copyfile(candidate_csv, last_good_csv)
-            state.current_step = step - 1
+            state.current_step = step  # advance so resume starts on the NEXT step
             state.current_offset_mv = offset_mv
             state.current_offset_mhz = offset_mhz
             save_session(state)
@@ -783,7 +859,12 @@ def run_session(state: SessionState) -> None:
             try:
                 revert_to_last_good(state)
             except Exception as ex:
-                eprint(f"WARNING: revert failed: {ex}")
+                eprint(f"CRITICAL: revert to last_good failed: {ex}")
+                eprint("GPU may still have the failed candidate curve applied. Restore manually:")
+                eprint(f"  python voltvandal.py restore --nvapi-cmd <path> --out {state.out_dir}")
+                state.current_step = step - 1
+                save_session(state)
+                sys.exit(1)
             state.current_step = step - 1
             save_session(state)
             print(
@@ -841,6 +922,7 @@ def build_session_from_args(args: argparse.Namespace) -> SessionState:
         doloming=args.doloming,
         doloming_mode=args.doloming_mode,
         gpuburn=args.gpuburn,
+        stress_timeout=getattr(args, "stress_timeout", None),
         poll_seconds=args.poll_seconds,
         temp_limit_c=args.temp_limit_c,
         power_limit_w=args.power_limit_w,
@@ -952,6 +1034,13 @@ def parse_args() -> argparse.Namespace:
         "--gpuburn", type=str, default=None, help="Path to gpu-burn exe (optional)"
     )
     sp.add_argument(
+        "--stress-timeout",
+        dest="stress_timeout",
+        type=int,
+        default=None,
+        help="Hard wall-clock timeout (seconds) for each stress run. Kills hung stress tools. Default: none",
+    )
+    sp.add_argument(
         "--poll-seconds",
         type=float,
         default=1.0,
@@ -996,6 +1085,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    warn_if_not_admin()
 
     if args.cmd in ("dump", "run", "restore"):
         if not Path(args.nvapi_cmd).exists():
