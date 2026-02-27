@@ -1435,6 +1435,113 @@ def cmd_restore(args: argparse.Namespace) -> None:
 
 
 # ----------------------------
+# Startup persistence (Windows Task Scheduler)
+# ----------------------------
+_STARTUP_TASK_PREFIX = "VoltVandal-RestoreCurve"
+
+
+def _startup_task_name(gpu: int) -> str:
+    return f"{_STARTUP_TASK_PREFIX}-GPU{gpu}"
+
+
+def _run_powershell(script: str) -> "subprocess.CompletedProcess[str]":
+    """Run a PowerShell script via -EncodedCommand to avoid shell-quoting issues."""
+    import base64
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+        capture_output=True,
+        text=True,
+    )
+
+
+def cmd_register_startup(args: argparse.Namespace) -> None:
+    """Register a Windows Task Scheduler logon task to restore the last-good curve."""
+    if not is_windows():
+        eprint("ERROR: register-startup is Windows-only (uses Task Scheduler).")
+        raise SystemExit(1)
+
+    script_path = Path(__file__).resolve()
+    python_exe = Path(sys.executable).resolve()
+    out_dir = Path(args.out).resolve()
+    delay = args.startup_delay
+    task = _startup_task_name(args.gpu)
+
+    if not out_dir.exists():
+        eprint(f"WARNING: --out directory does not exist yet: {out_dir}")
+        eprint("         The task will fail at logon until a tuning session writes last_good_curve.csv.")
+
+    def _q(s: object) -> str:
+        """Escape a value for use inside a PowerShell single-quoted string."""
+        return str(s).replace("'", "''")
+
+    ps = f"""$action = New-ScheduledTaskAction `
+    -Execute '{_q(python_exe)}' `
+    -Argument '"{_q(script_path)}" restore --gpu {args.gpu} --out "{_q(out_dir)}"' `
+    -WorkingDirectory '{_q(script_path.parent)}'
+
+$trigger = New-ScheduledTaskTrigger -AtLogon -User $env:USERNAME
+$trigger.Delay = 'PT{delay}S'
+
+$settings = New-ScheduledTaskSettingsSet `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+    -MultipleInstances IgnoreNew `
+    -Hidden $true
+
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "$env:USERDOMAIN\\$env:USERNAME" `
+    -LogonType Interactive `
+    -RunLevel Highest
+
+Register-ScheduledTask `
+    -TaskName '{_q(task)}' `
+    -Action   $action `
+    -Trigger  $trigger `
+    -Settings $settings `
+    -Principal $principal `
+    -Description 'VoltVandal: restore last-good VF curve {delay}s after logon (GPU {args.gpu})' `
+    -Force | Out-Null
+Write-Output 'REGISTERED'"""
+
+    cp = _run_powershell(ps)
+    if cp.returncode != 0 or "REGISTERED" not in cp.stdout:
+        eprint("ERROR: Failed to register startup task.")
+        eprint(cp.stderr.strip() or cp.stdout.strip())
+        raise SystemExit(1)
+
+    curve_path = out_dir / "last_good_curve.csv"
+    print(f"Startup task registered: {task}")
+    print(f"  Trigger  : logon  +{delay}s delay  (elevated / RunLevel Highest)")
+    print(f"  Curve    : {curve_path}")
+    print(f"  GPU      : {args.gpu}")
+    print(f'\nVerify : schtasks /query /tn "{task}" /fo list')
+    print(f"Remove : python voltvandal.py unregister-startup --gpu {args.gpu}")
+
+
+def cmd_unregister_startup(args: argparse.Namespace) -> None:
+    """Remove the VoltVandal logon startup task from Windows Task Scheduler."""
+    if not is_windows():
+        eprint("ERROR: unregister-startup is Windows-only.")
+        raise SystemExit(1)
+
+    task = _startup_task_name(args.gpu)
+
+    def _q(s: object) -> str:
+        return str(s).replace("'", "''")
+
+    ps = f"""Unregister-ScheduledTask -TaskName '{_q(task)}' -Confirm:$false -ErrorAction Stop
+Write-Output 'REMOVED'"""
+
+    cp = _run_powershell(ps)
+    if cp.returncode != 0 or "REMOVED" not in cp.stdout:
+        eprint(f"ERROR: Failed to remove task '{task}'.")
+        eprint(cp.stderr.strip() or cp.stdout.strip())
+        raise SystemExit(1)
+
+    print(f"Startup task removed: {task}")
+
+
+# ----------------------------
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
@@ -1592,6 +1699,29 @@ def parse_args() -> argparse.Namespace:
         help="Curve csv to apply (default: last_good_curve.csv in --out)",
     )
     sp.set_defaults(func=cmd_restore)
+
+    sp = sub.add_parser(
+        "register-startup",
+        help="Register a logon task that auto-applies the last-good curve on boot (Windows only).",
+    )
+    sp.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
+    sp.add_argument("--out", required=True, help="Artifacts folder containing last_good_curve.csv")
+    sp.add_argument(
+        "--startup-delay",
+        dest="startup_delay",
+        type=int,
+        default=15,
+        metavar="SECONDS",
+        help="Seconds to wait after logon before applying the curve (default: 15).",
+    )
+    sp.set_defaults(func=cmd_register_startup)
+
+    sp = sub.add_parser(
+        "unregister-startup",
+        help="Remove the VoltVandal logon startup task (Windows only).",
+    )
+    sp.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
+    sp.set_defaults(func=cmd_unregister_startup)
 
     return p.parse_args()
 
