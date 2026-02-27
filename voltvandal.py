@@ -160,7 +160,9 @@ def load_curve_csv(path: Path) -> List[CurvePoint]:
             raise ValueError(f"CSV has no header: {path}")
         required = {"voltageUV", "frequencyKHz"}
         if not required.issubset(set(reader.fieldnames)):
-            raise ValueError(f"CSV header must include {required}, got {reader.fieldnames}")
+            raise ValueError(
+                f"CSV header must include {required}, got {reader.fieldnames}"
+            )
         for row in reader:
             v = int(row["voltageUV"])
             fk = int(row["frequencyKHz"])
@@ -351,7 +353,11 @@ def run_doloming(
         last_output = out_text
         log_path.write_text(out_text, encoding="utf-8", errors="replace")
 
-        if p.returncode not in (0, None) and len(out_text) < 400 and re.search(r"usage|help|unknown option|invalid", out_text, re.I):
+        if (
+            p.returncode not in (0, None)
+            and len(out_text) < 400
+            and re.search(r"usage|help|unknown option|invalid", out_text, re.I)
+        ):
             continue
 
         return (p.returncode or 0, out_text)
@@ -395,7 +401,7 @@ def run_gpuburn(
     # Prefer an explicit numeric error counter if present.
     m = re.search(r"errors?\s*[:=]\s*(\d+)", out_text, re.I)
     if m:
-        ok = (int(m.group(1)) == 0)
+        ok = int(m.group(1)) == 0
     else:
         # No explicit counter found — conservative default.
         ok = False
@@ -454,7 +460,16 @@ class NvmlMonitor:
         with self.log_csv.open("a", newline="") as f:
             w = csv.writer(f)
             if first:
-                w.writerow(["utc", "temp_c", "power_w", "clock_mhz", "util_gpu", "throttle_reasons"])
+                w.writerow(
+                    [
+                        "utc",
+                        "temp_c",
+                        "power_w",
+                        "clock_mhz",
+                        "util_gpu",
+                        "throttle_reasons",
+                    ]
+                )
 
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
@@ -462,23 +477,39 @@ class NvmlMonitor:
     def _loop(self) -> None:
         while not self.stop_event.is_set():
             try:
-                temp = int(pynvml.nvmlDeviceGetTemperature(self.handle, pynvml.NVML_TEMPERATURE_GPU))
+                temp = int(
+                    pynvml.nvmlDeviceGetTemperature(
+                        self.handle, pynvml.NVML_TEMPERATURE_GPU
+                    )
+                )
                 power = float(pynvml.nvmlDeviceGetPowerUsage(self.handle)) / 1000.0
-                clock = int(pynvml.nvmlDeviceGetClockInfo(self.handle, pynvml.NVML_CLOCK_GRAPHICS))
+                clock = int(
+                    pynvml.nvmlDeviceGetClockInfo(
+                        self.handle, pynvml.NVML_CLOCK_GRAPHICS
+                    )
+                )
                 util = int(pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu)
-                throttle = int(pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(self.handle))
+                throttle = int(
+                    pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(self.handle)
+                )
 
                 snap = MonitorSnapshot(temp, power, clock, util, throttle)
                 self.last_snapshot = snap
 
-                self.max_temp = temp if self.max_temp is None else max(self.max_temp, temp)
-                self.max_power = power if self.max_power is None else max(self.max_power, power)
+                self.max_temp = (
+                    temp if self.max_temp is None else max(self.max_temp, temp)
+                )
+                self.max_power = (
+                    power if self.max_power is None else max(self.max_power, power)
+                )
                 if throttle != 0:
                     self.any_throttle = True
 
                 with self.log_csv.open("a", newline="") as f:
                     w = csv.writer(f)
-                    w.writerow([now_utc_iso(), temp, f"{power:.1f}", clock, util, throttle])
+                    w.writerow(
+                        [now_utc_iso(), temp, f"{power:.1f}", clock, util, throttle]
+                    )
 
                 if temp >= self.temp_limit_c:
                     self.abort_event.set()
@@ -513,12 +544,18 @@ class NvmlMonitor:
 # Session / persistence
 # ----------------------------
 def session_paths(out_dir: Path) -> Tuple[Path, Path, Path]:
-    return out_dir / "stock_curve.csv", out_dir / "last_good_curve.csv", out_dir / "session.json"
+    return (
+        out_dir / "stock_curve.csv",
+        out_dir / "last_good_curve.csv",
+        out_dir / "session.json",
+    )
 
 
 def save_session(state: SessionState) -> None:
     state.updated_utc = now_utc_iso()
-    Path(state.checkpoint_json).write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
+    Path(state.checkpoint_json).write_text(
+        json.dumps(asdict(state), indent=2), encoding="utf-8"
+    )
 
 
 def load_session(out_dir: Path) -> SessionState:
@@ -531,7 +568,9 @@ def load_session(out_dir: Path) -> SessionState:
 # ----------------------------
 # Candidate evaluation
 # ----------------------------
-def evaluate_candidate(state: SessionState, candidate_csv: Path, candidate_label: str) -> CandidateResult:
+def evaluate_candidate(
+    state: SessionState, candidate_csv: Path, candidate_label: str
+) -> CandidateResult:
     out_dir = Path(state.out_dir)
     logs_dir = out_dir / "logs"
     ensure_dir(logs_dir)
@@ -563,41 +602,99 @@ def evaluate_candidate(state: SessionState, candidate_csv: Path, candidate_label
 
     if state.doloming:
         dololog = logs_dir / f"{candidate_label}_doloming_{state.doloming_mode}.log"
-        rc, out_text = run_doloming(state.doloming, state.doloming_mode, state.stress_seconds, None, dololog, abort_event)
+        rc, out_text = run_doloming(
+            state.doloming,
+            state.doloming_mode,
+            state.stress_seconds,
+            None,
+            dololog,
+            abort_event,
+        )
         stress_exit_codes["doloming"] = rc
         if rc != 0:
             if monitor:
                 monitor.stop()
-            return CandidateResult(False, f"DOLOMING_RC_{rc}", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+            return CandidateResult(
+                False,
+                f"DOLOMING_RC_{rc}",
+                monitor.max_temp if monitor else None,
+                monitor.max_power if monitor else None,
+                monitor.any_throttle if monitor else None,
+                stress_exit_codes,
+            )
         if re.search(r"\boom\b|\bout of memory\b|\bfail\b|\berror\b", out_text, re.I):
             if monitor:
                 monitor.stop()
-            return CandidateResult(False, "DOLOMING_OUTPUT_ERROR_KEYWORD", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+            return CandidateResult(
+                False,
+                "DOLOMING_OUTPUT_ERROR_KEYWORD",
+                monitor.max_temp if monitor else None,
+                monitor.max_power if monitor else None,
+                monitor.any_throttle if monitor else None,
+                stress_exit_codes,
+            )
 
     if state.gpuburn:
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
-        rc, out_text, parsed_ok = run_gpuburn(state.gpuburn, state.stress_seconds, None, burnlog, abort_event)
+        rc, out_text, parsed_ok = run_gpuburn(
+            state.gpuburn, state.stress_seconds, None, burnlog, abort_event
+        )
         stress_exit_codes["gpuburn"] = rc
         if rc != 0:
             if monitor:
                 monitor.stop()
-            return CandidateResult(False, f"GPUBURN_RC_{rc}", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+            return CandidateResult(
+                False,
+                f"GPUBURN_RC_{rc}",
+                monitor.max_temp if monitor else None,
+                monitor.max_power if monitor else None,
+                monitor.any_throttle if monitor else None,
+                stress_exit_codes,
+            )
         if not parsed_ok:
             if monitor:
                 monitor.stop()
-            return CandidateResult(False, "GPUBURN_UNCONFIRMED_ZERO_ERRORS", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+            return CandidateResult(
+                False,
+                "GPUBURN_UNCONFIRMED_ZERO_ERRORS",
+                monitor.max_temp if monitor else None,
+                monitor.max_power if monitor else None,
+                monitor.any_throttle if monitor else None,
+                stress_exit_codes,
+            )
         if re.search(r"\bnan\b|\bfail\b|\berror\b", out_text, re.I):
             if monitor:
                 monitor.stop()
-            return CandidateResult(False, "GPUBURN_OUTPUT_ERROR_KEYWORD", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+            return CandidateResult(
+                False,
+                "GPUBURN_OUTPUT_ERROR_KEYWORD",
+                monitor.max_temp if monitor else None,
+                monitor.max_power if monitor else None,
+                monitor.any_throttle if monitor else None,
+                stress_exit_codes,
+            )
 
     if monitor:
         if monitor.abort_event.is_set():
             monitor.stop()
-            return CandidateResult(False, "MONITOR_ABORT_THRESHOLD", monitor.max_temp, monitor.max_power, monitor.any_throttle, stress_exit_codes)
+            return CandidateResult(
+                False,
+                "MONITOR_ABORT_THRESHOLD",
+                monitor.max_temp,
+                monitor.max_power,
+                monitor.any_throttle,
+                stress_exit_codes,
+            )
         monitor.stop()
 
-    return CandidateResult(True, "PASS", monitor.max_temp if monitor else None, monitor.max_power if monitor else None, monitor.any_throttle if monitor else None, stress_exit_codes)
+    return CandidateResult(
+        True,
+        "PASS",
+        monitor.max_temp if monitor else None,
+        monitor.max_power if monitor else None,
+        monitor.any_throttle if monitor else None,
+        stress_exit_codes,
+    )
 
 
 def revert_to_last_good(state: SessionState) -> None:
@@ -621,7 +718,9 @@ def run_session(state: SessionState) -> None:
         print("Reached max steps. Nothing to do.")
         return
 
-    print(f"Starting from step {state.current_step}/{state.max_steps} mode={state.mode}")
+    print(
+        f"Starting from step {state.current_step}/{state.max_steps} mode={state.mode}"
+    )
 
     while state.current_step < state.max_steps:
         step = state.current_step + 1
@@ -659,7 +758,18 @@ def run_session(state: SessionState) -> None:
 
         steps_log = out_dir / "steps.jsonl"
         with steps_log.open("a", encoding="utf-8") as f:
-            f.write(json.dumps({**asdict(result), "utc": now_utc_iso(), "label": label, "offset_mv": offset_mv, "offset_mhz": offset_mhz}) + "\n")
+            f.write(
+                json.dumps(
+                    {
+                        **asdict(result),
+                        "utc": now_utc_iso(),
+                        "label": label,
+                        "offset_mv": offset_mv,
+                        "offset_mhz": offset_mhz,
+                    }
+                )
+                + "\n"
+            )
 
         if result.ok:
             shutil.copyfile(candidate_csv, last_good_csv)
@@ -676,7 +786,9 @@ def run_session(state: SessionState) -> None:
                 eprint(f"WARNING: revert failed: {ex}")
             state.current_step = step - 1
             save_session(state)
-            print("Stopped after failure. You can adjust step sizes/limits and resume (it will retry this step).")
+            print(
+                "Stopped after failure. You can adjust step sizes/limits and resume (it will retry this step)."
+            )
             break
 
 
@@ -769,40 +881,114 @@ def cmd_restore(args: argparse.Namespace) -> None:
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="VoltVandal v1.1 (single-file) - VF curve tweak + stress + monitor harness.")
+    p = argparse.ArgumentParser(
+        description="VoltVandal v1.1 (single-file) - VF curve tweak + stress + monitor harness."
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--gpu", type=int, default=0, help="GPU index (default: 0)")
-    common.add_argument("--nvapi-cmd", dest="nvapi_cmd", required=True, help="Path to nvapi-cmd.exe")
-    common.add_argument("--out", required=True, help="Artifacts output folder (e.g. artifacts)")
+    common.add_argument(
+        "--nvapi-cmd", dest="nvapi_cmd", required=True, help="Path to nvapi-cmd.exe"
+    )
+    common.add_argument(
+        "--out", required=True, help="Artifacts output folder (e.g. artifacts)"
+    )
 
-    sp = sub.add_parser("dump", parents=[common], help="Dump current VF curve and create stock/last_good artifacts.")
+    sp = sub.add_parser(
+        "dump",
+        parents=[common],
+        help="Dump current VF curve and create stock/last_good artifacts.",
+    )
     sp.set_defaults(func=cmd_dump)
 
-    sp = sub.add_parser("run", parents=[common], help="Start a new session and run tuning steps.")
+    sp = sub.add_parser(
+        "run", parents=[common], help="Start a new session and run tuning steps."
+    )
     sp.add_argument("--mode", choices=["uv", "oc", "hybrid"], default="uv")
-    sp.add_argument("--bin-min-mv", type=int, default=850, help="Min mV for affected voltage bin")
-    sp.add_argument("--bin-max-mv", type=int, default=950, help="Max mV for affected voltage bin")
-    sp.add_argument("--step-mv", type=int, default=5, help="mV step size per step (uv/hybrid). Default 5")
-    sp.add_argument("--step-mhz", type=int, default=5, help="MHz step size per step (oc/hybrid). Default 5")
-    sp.add_argument("--max-steps", type=int, default=20, help="Max tuning steps to attempt. Default 20")
-    sp.add_argument("--stress-seconds", type=int, default=90, help="Seconds per stress tool step. Default 90")
-    sp.add_argument("--doloming", type=str, default=None, help="Path to doloMing stress script (.py) or exe (optional)")
-    sp.add_argument("--doloming-mode", type=str, default="ray", help="doloMing mode (e.g. ray/matrix). Default ray")
-    sp.add_argument("--gpuburn", type=str, default=None, help="Path to gpu-burn exe (optional)")
-    sp.add_argument("--poll-seconds", type=float, default=1.0, help="NVML poll interval seconds. Default 1.0")
-    sp.add_argument("--temp-limit-c", type=int, default=83, help="Abort temp threshold. Default 83C")
-    sp.add_argument("--power-limit-w", type=float, default=350.0, help="Abort power threshold. Default 350W")
-    sp.add_argument("--abort-on-throttle", action="store_true", help="Abort if any throttle reason is nonzero")
+    sp.add_argument(
+        "--bin-min-mv", type=int, default=850, help="Min mV for affected voltage bin"
+    )
+    sp.add_argument(
+        "--bin-max-mv", type=int, default=950, help="Max mV for affected voltage bin"
+    )
+    sp.add_argument(
+        "--step-mv",
+        type=int,
+        default=5,
+        help="mV step size per step (uv/hybrid). Default 5",
+    )
+    sp.add_argument(
+        "--step-mhz",
+        type=int,
+        default=5,
+        help="MHz step size per step (oc/hybrid). Default 5",
+    )
+    sp.add_argument(
+        "--max-steps",
+        type=int,
+        default=20,
+        help="Max tuning steps to attempt. Default 20",
+    )
+    sp.add_argument(
+        "--stress-seconds",
+        type=int,
+        default=90,
+        help="Seconds per stress tool step. Default 90",
+    )
+    sp.add_argument(
+        "--doloming",
+        type=str,
+        default=None,
+        help="Path to doloMing stress script (.py) or exe (optional)",
+    )
+    sp.add_argument(
+        "--doloming-mode",
+        type=str,
+        default="ray",
+        help="doloMing mode (e.g. ray/matrix). Default ray",
+    )
+    sp.add_argument(
+        "--gpuburn", type=str, default=None, help="Path to gpu-burn exe (optional)"
+    )
+    sp.add_argument(
+        "--poll-seconds",
+        type=float,
+        default=1.0,
+        help="NVML poll interval seconds. Default 1.0",
+    )
+    sp.add_argument(
+        "--temp-limit-c", type=int, default=83, help="Abort temp threshold. Default 83C"
+    )
+    sp.add_argument(
+        "--power-limit-w",
+        type=float,
+        default=350.0,
+        help="Abort power threshold. Default 350W",
+    )
+    sp.add_argument(
+        "--abort-on-throttle",
+        action="store_true",
+        help="Abort if any throttle reason is nonzero",
+    )
     sp.set_defaults(func=cmd_run)
 
-    sp = sub.add_parser("resume", help="Resume an existing session from --out/session.json")
-    sp.add_argument("--out", required=True, help="Artifacts output folder (e.g. artifacts)")
+    sp = sub.add_parser(
+        "resume", help="Resume an existing session from --out/session.json"
+    )
+    sp.add_argument(
+        "--out", required=True, help="Artifacts output folder (e.g. artifacts)"
+    )
     sp.set_defaults(func=cmd_resume)
 
-    sp = sub.add_parser("restore", parents=[common], help="Apply a curve (default last_good) and exit.")
-    sp.add_argument("--curve", default=None, help="Curve csv to apply (default: last_good_curve.csv in --out)")
+    sp = sub.add_parser(
+        "restore", parents=[common], help="Apply a curve (default last_good) and exit."
+    )
+    sp.add_argument(
+        "--curve",
+        default=None,
+        help="Curve csv to apply (default: last_good_curve.csv in --out)",
+    )
     sp.set_defaults(func=cmd_restore)
 
     return p.parse_args()
