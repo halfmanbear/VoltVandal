@@ -19,17 +19,23 @@ DISCLAIMERS
 Dependencies:
   pip install pynvml
 
-External tools (place alongside this script or specify paths):
-  - nvapi-cmd.exe  (vf curve dump/apply)
+VF-curve backend (auto-selected, first available wins):
+  1. nvapi_curve.py  — pure-Python ctypes wrapper (included, no extra install)
+  2. nvapi-cmd.exe   — legacy subprocess fallback (pass via --nvapi-cmd)
+
+Optional stress tools (place alongside this script or specify paths):
   - doloMing stress script (python) OR packaged exe
   - gpu-burn.exe   (optional)
 
 Typical usage:
-  # Dump and backup stock curve (GPU 0)
+  # Dump and backup stock curve (GPU 0) — nvapi_curve.py used automatically
+  python voltvandal.py dump --gpu 0 --out artifacts
+
+  # Explicit legacy backend
   python voltvandal.py dump --gpu 0 --nvapi-cmd .\nvapi-cmd.exe --out artifacts
 
   # Run a simple UV sweep on a voltage bin range, stress with doloMing "ray"
-  python voltvandal.py run --gpu 0 --nvapi-cmd .\nvapi-cmd.exe --out artifacts ^
+  python voltvandal.py run --gpu 0 --out artifacts ^
     --mode uv --bin-min-mv 850 --bin-max-mv 950 --step-mv 5 --stress-seconds 90 ^
     --doloming .\doloMing\stress.py --doloming-mode ray
 
@@ -71,6 +77,15 @@ try:
     import pynvml  # type: ignore
 except Exception:
     pynvml = None  # allow dump/apply without NVML
+
+# VF-curve backend: prefer the native Python ctypes module; fall back to
+# spawning nvapi-cmd.exe as a subprocess (legacy / compatibility path).
+try:
+    import nvapi_curve as _nvapi_native  # type: ignore
+    _NVAPI_BACKEND = "native"
+except Exception:
+    _nvapi_native = None  # type: ignore[assignment]
+    _NVAPI_BACKEND = "subprocess"
 
 
 @dataclass
@@ -149,9 +164,8 @@ def is_windows() -> bool:
 def warn_if_not_admin() -> None:
     """On Windows, emit a warning when the process is not elevated.
 
-    nvapi-cmd.exe typically requires Administrator rights.  A missing privilege
-    will produce a confusing access-denied error deep in the run; better to
-    surface it immediately.
+    NVAPI VF-curve operations require Administrator rights regardless of
+    whether the native Python backend or nvapi-cmd.exe subprocess is used.
     """
     if not is_windows():
         return
@@ -160,7 +174,7 @@ def warn_if_not_admin() -> None:
         if not ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined]
             eprint(
                 "WARNING: Not running as Administrator. "
-                "nvapi-cmd.exe usually requires elevated privileges. "
+                "NVAPI VF-curve operations require elevated privileges. "
                 "Re-run from an elevated terminal if commands fail."
             )
     except Exception:
@@ -269,10 +283,21 @@ def run_cmd(
     )
 
 
-_NVAPI_TIMEOUT_S = 30  # seconds before nvapi-cmd.exe is considered hung
+_NVAPI_TIMEOUT_S = 30  # seconds before nvapi-cmd.exe is considered hung (subprocess path only)
 
 
-def nvapi_dump_curve(nvapi_cmd: str, gpu: int, out_csv: Path) -> None:
+def nvapi_dump_curve(nvapi_cmd: Optional[str], gpu: int, out_csv: Path) -> None:
+    if _nvapi_native is not None:
+        _nvapi_native.dump_curve(gpu, out_csv)
+        if not out_csv.exists() or out_csv.stat().st_size < 10:
+            raise RuntimeError(f"nvapi_curve.dump_curve did not produce a valid file: {out_csv}")
+        return
+    # subprocess fallback
+    if not nvapi_cmd:
+        raise RuntimeError(
+            "No VF-curve backend available: nvapi_curve.py not importable "
+            "and --nvapi-cmd not specified."
+        )
     cmd = [nvapi_cmd, "-curve", str(gpu), "-1", str(out_csv)]
     cp = run_cmd(cmd, capture=True, timeout=_NVAPI_TIMEOUT_S)
     if cp.returncode != 0:
@@ -283,7 +308,16 @@ def nvapi_dump_curve(nvapi_cmd: str, gpu: int, out_csv: Path) -> None:
         raise RuntimeError(f"nvapi-cmd dump did not produce a valid file: {out_csv}")
 
 
-def nvapi_apply_curve(nvapi_cmd: str, gpu: int, in_csv: Path) -> None:
+def nvapi_apply_curve(nvapi_cmd: Optional[str], gpu: int, in_csv: Path) -> None:
+    if _nvapi_native is not None:
+        _nvapi_native.apply_curve(gpu, in_csv)
+        return
+    # subprocess fallback
+    if not nvapi_cmd:
+        raise RuntimeError(
+            "No VF-curve backend available: nvapi_curve.py not importable "
+            "and --nvapi-cmd not specified."
+        )
     cmd = [nvapi_cmd, "-curve", str(gpu), "1", str(in_csv)]
     cp = run_cmd(cmd, capture=True, timeout=_NVAPI_TIMEOUT_S)
     if cp.returncode != 0:

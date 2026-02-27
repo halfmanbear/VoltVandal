@@ -10,10 +10,10 @@
       2. pip packages             pynvml, psutil, numpy, PyOpenGL
       3. cupy (CUDA-accelerated)  auto-detects CUDA version, or use -CudaVersion
       4. doloMing stress tool     cloned from GitHub; stress.py shim created
-      5. nvapi-cmd.exe            downloaded from buswedg/nvapi-cmd (GitHub)
 
-    Run from an elevated (Administrator) PowerShell terminal because
-    nvapi-cmd.exe requires Admin rights at runtime.
+    VF-curve backend (nvapi_curve.py) is pure Python — no extra binary needed.
+    Run from an elevated (Administrator) PowerShell terminal because NVAPI
+    VF-curve operations require elevated privileges at runtime.
 
 .PARAMETER InstallDir
     Root directory where voltvandal.py lives.
@@ -45,7 +45,7 @@
     .\setup.ps1 -SkipCupy
 
 .LINK
-    nvapi-cmd             : https://github.com/buswedg/nvapi-cmd
+    nvapi_curve.py source : https://github.com/buswedg/nvapi-cmd  (reference C++)
     doloMing stress tool  : https://github.com/doloMing/gpu-cpu-stress-tests
     pynvml                : https://pypi.org/project/pynvml/
     cupy install guide    : https://docs.cupy.dev/en/stable/install.html
@@ -349,69 +349,22 @@ if __name__ == "__main__":
     Write-Warn "Skipping doloMing setup."
 }
 
-# ─── 6. nvapi-cmd.exe ─────────────────────────────────────────────────────────
-# Source: https://github.com/buswedg/nvapi-cmd
-# The repo ships a pre-compiled nvapi-cmd.exe in its root directory.
-Write-Step "Installing nvapi-cmd.exe  (buswedg/nvapi-cmd)"
+# ─── 6. Verify nvapi_curve.py (native Python VF-curve backend) ───────────────
+Write-Step "Verifying nvapi_curve.py  (native Python NVAPI backend)"
 
-$nvapiPath  = Join-Path $InstallDir "nvapi-cmd.exe"
-$nvapiRepo  = "https://github.com/buswedg/nvapi-cmd.git"
-$nvapiRawExe = "https://raw.githubusercontent.com/buswedg/nvapi-cmd/master/nvapi-cmd.exe"
-
-if (Test-Path $nvapiPath) {
-    Write-OK "nvapi-cmd.exe already present — skipping download."
+$nvapiCurvePath = Join-Path $InstallDir "nvapi_curve.py"
+if (Test-Path $nvapiCurvePath) {
+    Write-OK "nvapi_curve.py found — no nvapi-cmd.exe binary needed."
+    Write-Info "  VoltVandal will use the native Python backend automatically."
 } else {
-    $downloaded = $false
+    Write-Warn "nvapi_curve.py not found at expected location: $nvapiCurvePath"
+    Write-Info "  Make sure you cloned the full VoltVandal repository."
+}
 
-    # ── Attempt 1: git clone then copy exe ───────────────────────────────────
-    try {
-        $null = & git --version 2>&1
-        $gitAvailable = $true
-    } catch {
-        $gitAvailable = $false
-    }
-
-    if ($gitAvailable) {
-        $nvapiCloneDir = Join-Path $env:TEMP "nvapi-cmd-clone"
-        Write-Info "  Cloning buswedg/nvapi-cmd ..."
-        try {
-            Remove-Item $nvapiCloneDir -Recurse -Force -ErrorAction SilentlyContinue
-            & git clone --quiet --depth 1 $nvapiRepo $nvapiCloneDir 2>&1 | Out-Null
-            $clonedExe = Join-Path $nvapiCloneDir "nvapi-cmd.exe"
-            if (Test-Path $clonedExe) {
-                Copy-Item $clonedExe $nvapiPath
-                Write-OK "nvapi-cmd.exe cloned and placed at $nvapiPath"
-                $downloaded = $true
-            } else {
-                Write-Warn "Clone succeeded but nvapi-cmd.exe not found in repo root."
-            }
-        } catch {
-            Write-Warn "git clone failed: $_"
-        } finally {
-            Remove-Item $nvapiCloneDir -Recurse -Force -ErrorAction SilentlyContinue
-        }
-    }
-
-    # ── Attempt 2: direct raw download of the compiled exe ───────────────────
-    if (-not $downloaded) {
-        Write-Info "  Downloading nvapi-cmd.exe directly from GitHub raw ..."
-        try {
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-            Invoke-WebRequest -Uri $nvapiRawExe -OutFile $nvapiPath -UseBasicParsing
-            if (Test-Path $nvapiPath) {
-                Write-OK "nvapi-cmd.exe downloaded to $nvapiPath"
-                $downloaded = $true
-            }
-        } catch {
-            Write-Err "Direct download also failed: $_"
-        }
-    }
-
-    if (-not $downloaded) {
-        Write-Warn "Could not obtain nvapi-cmd.exe automatically."
-        Write-Info "  Download manually from: https://github.com/buswedg/nvapi-cmd"
-        Write-Info "  Place nvapi-cmd.exe in:  $InstallDir"
-    }
+# Keep nvapi-cmd.exe as an optional legacy fallback (pass --nvapi-cmd if needed)
+$nvapiExePath = Join-Path $InstallDir "nvapi-cmd.exe"
+if (Test-Path $nvapiExePath) {
+    Write-Info "  Legacy nvapi-cmd.exe also present (subprocess fallback available)."
 }
 
 # ─── 7. Quick sanity-import of pynvml ────────────────────────────────────────
@@ -424,21 +377,19 @@ if ($LASTEXITCODE -eq 0) {
 }
 
 # ─── 8. Final summary ────────────────────────────────────────────────────────
-$doloRelPath  = ".\doloMing\stress.py"
-$nvapiRelPath = ".\nvapi-cmd.exe"
+$doloRelPath = ".\doloMing\stress.py"
 
 Write-Host ""
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Magenta
 Write-Host "  Setup complete — quick-start reference" -ForegroundColor Magenta
 Write-Host "══════════════════════════════════════════════════" -ForegroundColor Magenta
 Write-Host ""
-Write-Host "  # 1. Dump stock VF curve (requires nvapi-cmd.exe):"
-Write-Host "  python voltvandal.py dump ``" -ForegroundColor White
-Write-Host "      --gpu 0 --nvapi-cmd $nvapiRelPath --out artifacts" -ForegroundColor White
+Write-Host "  # 1. Dump stock VF curve (uses nvapi_curve.py automatically):"
+Write-Host "  python voltvandal.py dump --gpu 0 --out artifacts" -ForegroundColor White
 Write-Host ""
 Write-Host "  # 2. Run UV sweep, stress with doloMing ray mode:"
 Write-Host "  python voltvandal.py run ``" -ForegroundColor White
-Write-Host "      --gpu 0 --nvapi-cmd $nvapiRelPath --out artifacts ``" -ForegroundColor White
+Write-Host "      --gpu 0 --out artifacts ``" -ForegroundColor White
 Write-Host "      --mode uv --bin-min-mv 850 --bin-max-mv 950 --step-mv 5 ``" -ForegroundColor White
 Write-Host "      --stress-seconds 120 --stress-timeout 180 ``" -ForegroundColor White
 Write-Host "      --doloming $doloRelPath --doloming-mode ray ``" -ForegroundColor White
@@ -448,12 +399,5 @@ Write-Host "  # 3. Resume from checkpoint:"
 Write-Host "  python voltvandal.py resume --out artifacts" -ForegroundColor White
 Write-Host ""
 Write-Host "  # 4. Revert GPU to last known-good curve:"
-Write-Host "  python voltvandal.py restore --gpu 0 --nvapi-cmd $nvapiRelPath --out artifacts" -ForegroundColor White
-Write-Host ""
-
-if (-not (Test-Path $nvapiPath)) {
-    Write-Host "  [!!] nvapi-cmd.exe missing — download from:" -ForegroundColor Yellow
-    Write-Host "       https://github.com/buswedg/nvapi-cmd" -ForegroundColor Yellow
-    Write-Host "       Place nvapi-cmd.exe in: $InstallDir" -ForegroundColor Yellow
-}
+Write-Host "  python voltvandal.py restore --gpu 0 --out artifacts" -ForegroundColor White
 Write-Host ""
