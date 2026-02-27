@@ -10,7 +10,7 @@
       2. pip packages             pynvml, psutil, numpy, PyOpenGL
       3. cupy (CUDA-accelerated)  auto-detects CUDA version, or use -CudaVersion
       4. doloMing stress tool     cloned from GitHub; stress.py shim created
-      5. nvapi-cmd.exe            NOT automated — see notes printed at end
+      5. nvapi-cmd.exe            downloaded from buswedg/nvapi-cmd (GitHub)
 
     Run from an elevated (Administrator) PowerShell terminal because
     nvapi-cmd.exe requires Admin rights at runtime.
@@ -45,6 +45,7 @@
     .\setup.ps1 -SkipCupy
 
 .LINK
+    nvapi-cmd             : https://github.com/buswedg/nvapi-cmd
     doloMing stress tool  : https://github.com/doloMing/gpu-cpu-stress-tests
     pynvml                : https://pypi.org/project/pynvml/
     cupy install guide    : https://docs.cupy.dev/en/stable/install.html
@@ -349,29 +350,68 @@ if __name__ == "__main__":
 }
 
 # ─── 6. nvapi-cmd.exe ─────────────────────────────────────────────────────────
-Write-Step "Checking for nvapi-cmd.exe"
+# Source: https://github.com/buswedg/nvapi-cmd
+# The repo ships a pre-compiled nvapi-cmd.exe in its root directory.
+Write-Step "Installing nvapi-cmd.exe  (buswedg/nvapi-cmd)"
 
-$nvapiPath = Join-Path $InstallDir "nvapi-cmd.exe"
+$nvapiPath  = Join-Path $InstallDir "nvapi-cmd.exe"
+$nvapiRepo  = "https://github.com/buswedg/nvapi-cmd.git"
+$nvapiRawExe = "https://raw.githubusercontent.com/buswedg/nvapi-cmd/master/nvapi-cmd.exe"
+
 if (Test-Path $nvapiPath) {
-    Write-OK "nvapi-cmd.exe found at $nvapiPath"
+    Write-OK "nvapi-cmd.exe already present — skipping download."
 } else {
-    Write-Warn "nvapi-cmd.exe NOT found."
-    Write-Host ""
-    Write-Host "  ┌─────────────────────────────────────────────────────────────┐" -ForegroundColor Yellow
-    Write-Host "  │  nvapi-cmd.exe must be obtained manually.                   │" -ForegroundColor Yellow
-    Write-Host "  │                                                             │" -ForegroundColor Yellow
-    Write-Host "  │  VoltVandal calls it as:                                    │" -ForegroundColor Yellow
-    Write-Host "  │    nvapi-cmd.exe -curve <gpu> -1 <out.csv>   (dump)        │" -ForegroundColor Yellow
-    Write-Host "  │    nvapi-cmd.exe -curve <gpu>  1 <in.csv>    (apply)       │" -ForegroundColor Yellow
-    Write-Host "  │                                                             │" -ForegroundColor Yellow
-    Write-Host "  │  Closest known public tool (different interface — may       │" -ForegroundColor Yellow
-    Write-Host "  │  need adapting or renaming):                                │" -ForegroundColor Yellow
-    Write-Host "  │    https://github.com/Demion/nvapioc/releases              │" -ForegroundColor Yellow
-    Write-Host "  │                                                             │" -ForegroundColor Yellow
-    Write-Host "  │  Place the correct nvapi-cmd.exe here:                      │" -ForegroundColor Yellow
-    Write-Host "  │    $nvapiPath" -ForegroundColor Yellow
-    Write-Host "  └─────────────────────────────────────────────────────────────┘" -ForegroundColor Yellow
-    Write-Host ""
+    $downloaded = $false
+
+    # ── Attempt 1: git clone then copy exe ───────────────────────────────────
+    try {
+        $null = & git --version 2>&1
+        $gitAvailable = $true
+    } catch {
+        $gitAvailable = $false
+    }
+
+    if ($gitAvailable) {
+        $nvapiCloneDir = Join-Path $env:TEMP "nvapi-cmd-clone"
+        Write-Info "  Cloning buswedg/nvapi-cmd ..."
+        try {
+            Remove-Item $nvapiCloneDir -Recurse -Force -ErrorAction SilentlyContinue
+            & git clone --quiet --depth 1 $nvapiRepo $nvapiCloneDir 2>&1 | Out-Null
+            $clonedExe = Join-Path $nvapiCloneDir "nvapi-cmd.exe"
+            if (Test-Path $clonedExe) {
+                Copy-Item $clonedExe $nvapiPath
+                Write-OK "nvapi-cmd.exe cloned and placed at $nvapiPath"
+                $downloaded = $true
+            } else {
+                Write-Warn "Clone succeeded but nvapi-cmd.exe not found in repo root."
+            }
+        } catch {
+            Write-Warn "git clone failed: $_"
+        } finally {
+            Remove-Item $nvapiCloneDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # ── Attempt 2: direct raw download of the compiled exe ───────────────────
+    if (-not $downloaded) {
+        Write-Info "  Downloading nvapi-cmd.exe directly from GitHub raw ..."
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $nvapiRawExe -OutFile $nvapiPath -UseBasicParsing
+            if (Test-Path $nvapiPath) {
+                Write-OK "nvapi-cmd.exe downloaded to $nvapiPath"
+                $downloaded = $true
+            }
+        } catch {
+            Write-Err "Direct download also failed: $_"
+        }
+    }
+
+    if (-not $downloaded) {
+        Write-Warn "Could not obtain nvapi-cmd.exe automatically."
+        Write-Info "  Download manually from: https://github.com/buswedg/nvapi-cmd"
+        Write-Info "  Place nvapi-cmd.exe in:  $InstallDir"
+    }
 }
 
 # ─── 7. Quick sanity-import of pynvml ────────────────────────────────────────
@@ -412,6 +452,8 @@ Write-Host "  python voltvandal.py restore --gpu 0 --nvapi-cmd $nvapiRelPath --o
 Write-Host ""
 
 if (-not (Test-Path $nvapiPath)) {
-    Write-Host "  [!!] ACTION REQUIRED: Place nvapi-cmd.exe in $InstallDir" -ForegroundColor Yellow
+    Write-Host "  [!!] nvapi-cmd.exe missing — download from:" -ForegroundColor Yellow
+    Write-Host "       https://github.com/buswedg/nvapi-cmd" -ForegroundColor Yellow
+    Write-Host "       Place nvapi-cmd.exe in: $InstallDir" -ForegroundColor Yellow
 }
 Write-Host ""
