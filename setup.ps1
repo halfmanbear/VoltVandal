@@ -7,7 +7,7 @@
     This script automates the full VoltVandal dependency setup on Windows:
 
       1. Python dependency check  (>= 3.7 required)
-      2. pip packages             pynvml, psutil, numpy, PyOpenGL
+      2. pip packages             nvidia-ml-py, psutil, numpy, PyOpenGL
       3. cupy (CUDA-accelerated)  auto-detects CUDA version, or use -CudaVersion
       4. doloMing stress tool     cloned from GitHub; stress.py shim created
 
@@ -20,10 +20,10 @@
     Defaults to the folder that contains this script.
 
 .PARAMETER CudaVersion
-    cupy CUDA suffix, e.g. "cu121" (CUDA 12.1), "cu118" (CUDA 11.8).
+    cupy CUDA suffix, e.g. "cuda12x" (CUDA 12.x), "cuda11x" (CUDA 11.2+).
     Run  nvcc --version  to find your installed CUDA version.
     If omitted the script will detect automatically; if detection fails
-    it falls back to "cu12x" (broad CUDA 12 wheel).
+    it falls back to "cuda12x" (broad CUDA 12 wheel).
 
 .PARAMETER SkipCupy
     Skip cupy installation entirely (e.g. if you only want ray/matrix modes
@@ -37,8 +37,8 @@
     .\setup.ps1
 
 .EXAMPLE
-    # Explicit CUDA 11.8 build of cupy:
-    .\setup.ps1 -CudaVersion cu118
+    # Explicit CUDA 11.x build of cupy:
+    .\setup.ps1 -CudaVersion cuda11x
 
 .EXAMPLE
     # Skip cupy (e.g. CUDA not installed yet):
@@ -47,7 +47,7 @@
 .LINK
     nvapi_curve.py source : https://github.com/buswedg/nvapi-cmd  (reference C++)
     doloMing stress tool  : https://github.com/doloMing/gpu-cpu-stress-tests
-    pynvml                : https://pypi.org/project/pynvml/
+    nvidia-ml-py          : https://pypi.org/project/nvidia-ml-py/
     cupy install guide    : https://docs.cupy.dev/en/stable/install.html
 #>
 
@@ -127,9 +127,16 @@ try {
 }
 
 # ─── 3. Core pip packages ────────────────────────────────────────────────────
-Write-Step "Installing pip packages (pynvml, psutil, numpy, PyOpenGL)"
+Write-Step "Installing pip packages (nvidia-ml-py, psutil, numpy, PyOpenGL)"
 
-$pipPkgs = @("pynvml", "psutil", "numpy", "PyOpenGL", "PyOpenGL_accelerate")
+# Remove deprecated pynvml wrapper if present (nvidia-ml-py replaces it)
+$oldPynvml = & $pythonExe -m pip show pynvml 2>&1
+if ($LASTEXITCODE -eq 0) {
+    Write-Info "  Removing deprecated 'pynvml' package (replaced by nvidia-ml-py)..."
+    & $pythonExe -m pip uninstall pynvml -y --quiet 2>&1 | Out-Null
+}
+
+$pipPkgs = @("nvidia-ml-py", "psutil", "numpy", "PyOpenGL", "PyOpenGL_accelerate")
 foreach ($pkg in $pipPkgs) {
     Write-Info "  pip install $pkg ..."
     & $pythonExe -m pip install --quiet --upgrade $pkg
@@ -147,33 +154,33 @@ if (-not $SkipCupy) {
     # Auto-detect CUDA version via nvcc if not supplied
     if ($CudaVersion -eq "") {
         try {
-            $nvccOut = & nvcc --version 2>&1
+            $nvccOut = (& nvcc --version 2>&1) -join "`n"
             if ($nvccOut -match "release (\d+)\.(\d+)") {
                 $cudaMaj = [int]$Matches[1]; $cudaMin = [int]$Matches[2]
-                # Map to cupy wheel suffix
-                if     ($cudaMaj -ge 12)                        { $CudaVersion = "cu12x" }
-                elseif ($cudaMaj -eq 11 -and $cudaMin -ge 8)   { $CudaVersion = "cu118" }
-                elseif ($cudaMaj -eq 11 -and $cudaMin -ge 6)   { $CudaVersion = "cu116" }
-                elseif ($cudaMaj -eq 11 -and $cudaMin -ge 2)   { $CudaVersion = "cu112" }
-                elseif ($cudaMaj -eq 11)                        { $CudaVersion = "cu111" }
-                elseif ($cudaMaj -eq 10 -and $cudaMin -ge 2)   { $CudaVersion = "cu102" }
-                elseif ($cudaMaj -eq 10)                        { $CudaVersion = "cu101" }
-                else                                             { $CudaVersion = "cu12x" }
+                # Map to cupy wheel suffix (PyPI names: cupy-cuda12x, cupy-cuda11x, etc.)
+                if     ($cudaMaj -ge 12)                        { $CudaVersion = "cuda12x" }
+                elseif ($cudaMaj -eq 11 -and $cudaMin -ge 2)   { $CudaVersion = "cuda11x" }
+                elseif ($cudaMaj -eq 11)                        { $CudaVersion = "cuda111" }
+                elseif ($cudaMaj -eq 10 -and $cudaMin -ge 2)   { $CudaVersion = "cuda102" }
+                else                                             { $CudaVersion = "cuda12x" }
                 Write-Info "  Detected CUDA $cudaMaj.$cudaMin  →  cupy-$CudaVersion"
+            } else {
+                Write-Warn "Could not parse CUDA version from nvcc output; defaulting to cupy-cuda12x."
+                $CudaVersion = "cuda12x"
             }
         } catch {
-            Write-Warn "nvcc not found; defaulting to cupy-cuda12x. Use -CudaVersion cuXXX to override."
-            $CudaVersion = "cu12x"
+            Write-Warn "nvcc not found; defaulting to cupy-cuda12x. Use -CudaVersion cudaXXX to override."
+            $CudaVersion = "cuda12x"
         }
     }
 
-    $cupyPkg = "cupy-cuda$CudaVersion"
+    $cupyPkg = "cupy-$CudaVersion"
     Write-Info "  pip install $cupyPkg ..."
     & $pythonExe -m pip install --quiet --upgrade $cupyPkg
     if ($LASTEXITCODE -ne 0) {
         Write-Warn "cupy install failed — doloMing may not work for GPU stress modes."
         Write-Info "  See https://docs.cupy.dev/en/stable/install.html for manual steps."
-        Write-Info "  Or re-run:  .\setup.ps1 -CudaVersion cu<your-version>"
+        Write-Info "  Or re-run:  .\setup.ps1 -CudaVersion cuda12x"
     } else {
         Write-OK "cupy ($cupyPkg)"
     }
@@ -369,7 +376,7 @@ if (Test-Path $nvapiExePath) {
 
 # ─── 7. Quick sanity-import of pynvml ────────────────────────────────────────
 Write-Step "Verifying pynvml import"
-$pynvmlCheck = & $pythonExe -c "import pynvml; print('pynvml', pynvml.__version__)" 2>&1
+$pynvmlCheck = & $pythonExe -c "import pynvml; pynvml.nvmlInit(); print('pynvml (nvidia-ml-py) OK'); pynvml.nvmlShutdown()" 2>&1
 if ($LASTEXITCODE -eq 0) {
     Write-OK $pynvmlCheck
 } else {
