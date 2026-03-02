@@ -98,6 +98,22 @@ except Exception:
     _nvapi_native = None  # type: ignore[assignment]
     _NVAPI_BACKEND = "subprocess"
 
+# GPU series reference profiles (optional companion module).
+try:
+    import gpu_profiles as _gpu_profiles  # type: ignore
+except Exception:
+    _gpu_profiles = None  # type: ignore[assignment]
+
+# Matplotlib for post-run VF curve plots (optional — graceful fallback if absent).
+try:
+    import matplotlib  # type: ignore
+    matplotlib.use("Agg")  # non-interactive; safe for background/headless use
+    import matplotlib.pyplot as plt  # type: ignore
+    _matplotlib_available = True
+except Exception:
+    plt = None  # type: ignore[assignment]
+    _matplotlib_available = False
+
 
 @dataclass
 class CurvePoint:
@@ -166,8 +182,21 @@ class SessionState:
     # vlock mode state (survives resume)
     vlock_target_mv: int = 0           # user-supplied anchor voltage
     vlock_anchor_freq_khz: int = 0     # peak freq confirmed stable in phase 1
-    vlock_uv_offset_mv: int = 0        # confirmed UV offset for sub-anchor bins in phase 2
+    vlock_uv_offset_mv: int = 0        # last confirmed UV offset (for display / legacy)
+    vlock_uv_bin_idx: int = -1         # Phase 2 outer loop: which sub-anchor bin is being tuned
+                                       # -1 = not started; counts down from anchor_idx-1 to 0
+    vlock_p2_current_gain_khz: int = 0 # Phase 2: gain currently being tested for the active bin
+                                       # 0 = use full oc_gain on next bin entry
     vlock_phase: str = "oc"            # "oc" | "uv" | "done"
+    vlock_oc_base_freq_khz: int = 0    # freq floor found by floor-search (0 = use stock)
+    vlock_start_freq_mhz: int = 0     # user-supplied OC start freq; baseline skipped when > 0
+
+    # power limit
+    power_limit_pct: int = 100        # % of GPU default TDP to apply before run (100 = no change)
+
+    # display
+    live_display: bool = True         # print live GPU metrics line during stress
+    no_plot: bool = False             # skip post-run VF curve PNG generation
 
     # bookkeeping
     started_utc: str = ""
@@ -298,6 +327,7 @@ def _build_vlock_curve(
     anchor_voltage_uv: int,
     anchor_freq_khz: int,
     uv_offset_uv: int,
+    cap_freq_khz: int = 0,
 ) -> List[CurvePoint]:
     """
     Build a candidate VF curve for vlock mode.
@@ -305,17 +335,105 @@ def _build_vlock_curve(
     Layout:
       - Index < anchor_idx  : voltage reduced by uv_offset_uv, freq unchanged (stock)
       - Index == anchor_idx : fixed at (anchor_voltage_uv, anchor_freq_khz)
-      - Index > anchor_idx  : stock (high-voltage / plateau bins left alone)
+      - Index > anchor_idx  : voltage unchanged, freq CAPPED at effective_cap
+
+    cap_freq_khz (optional):
+        0 (default) — cap all bins at/above anchor_idx at anchor_freq_khz.
+                      Standard Phase 1 behaviour: GPU ceiling = confirmed OC freq.
+        > 0         — override cap to this frequency instead (rarely needed).
+
+    Capping above-anchor bins prevents the GPU from boosting beyond the test
+    point during Phase 1.  Phase 2 uses _build_vlock_phase2_curves instead,
+    which lets the GPU boost freely up to the anchor during stress so that
+    doloMing's frequency-max mode produces meaningful scores.
     """
+    effective_cap = cap_freq_khz if cap_freq_khz > 0 else anchor_freq_khz
     out: List[CurvePoint] = []
     for i, p in enumerate(stock_points):
         if i < anchor_idx:
             out.append(CurvePoint(max(p.voltage_uv - uv_offset_uv, 0), p.freq_khz))
         elif i == anchor_idx:
-            out.append(CurvePoint(anchor_voltage_uv, anchor_freq_khz))
+            out.append(CurvePoint(anchor_voltage_uv, min(anchor_freq_khz, effective_cap)))
         else:
-            out.append(CurvePoint(p.voltage_uv, p.freq_khz))
+            # Cap frequency so the GPU cannot boost above the test point.
+            # Voltage is left at stock so the driver's safety margins remain intact.
+            out.append(CurvePoint(p.voltage_uv, min(p.freq_khz, effective_cap)))
     return out
+
+
+def _build_vlock_phase2_curves(
+    stock_points: List[CurvePoint],
+    last_good_points: List[CurvePoint],
+    bin_idx: int,
+    anchor_idx: int,
+    anchor_voltage_uv: int,
+    anchor_freq_khz: int,
+    oc_gain_khz: int,
+) -> Tuple[List[CurvePoint], List[CurvePoint]]:
+    """
+    Build (test_pts, save_pts) for Phase 2 per-bin OC-shift testing.
+
+    Phase 2 applies the same frequency gain achieved in Phase 1 (oc_gain_khz)
+    to sub-anchor bins individually while keeping their stock voltages.  Each
+    bin is tested one at a time (highest → lowest).
+
+    oc_gain_khz = anchor_achieved_freq - anchor_stock_freq  (e.g. +165 MHz)
+
+    For bin_idx the target frequency is min(stock_freq + oc_gain, anchor_freq).
+    Stock voltages are unchanged (no undervolting in Phase 2).
+
+    test_pts  — curve applied to the GPU during the stress run:
+      • bin_idx: stock voltage, shifted frequency (stock_freq + oc_gain_khz,
+        capped at anchor_freq_khz).
+      • All other sub-anchor bins: taken from last_good_points (already-
+        confirmed bins have their shifted freqs; unconfirmed bins remain at
+        stock).  NOT hard-capped at bin_target_freq — the GPU can boost freely
+        up to the anchor point, letting doloMing's 3 modes exercise the full
+        curve naturally:
+          - ray/matrix (50% util target): GPU naturally runs in the sub-anchor
+            voltage range, exercising lower bins under real moderate load.
+          - frequency-max: GPU boosts to anchor_freq, giving a meaningful
+            Score_gamma (not corrupted by a global MHz cap).
+      • Anchor: (anchor_voltage_uv, anchor_freq_khz) — full confirmed OC freq.
+      • Above-anchor: stock voltage, capped at anchor_freq_khz.
+
+    save_pts  — curve written to last_good_curve.csv on a passing test:
+      • bin_idx: stock voltage, shifted frequency at its own (uncapped) value.
+      • All other sub-anchor bins: last_good settings (already-confirmed bins
+        keep their shifted freqs; unconfirmed bins stay at stock).
+      • Anchor: (anchor_voltage_uv, anchor_freq_khz) — confirmed OC ceiling.
+      • Above-anchor: stock voltage, capped at anchor_freq_khz.
+    """
+    bin_target_freq = min(
+        stock_points[bin_idx].freq_khz + oc_gain_khz, anchor_freq_khz
+    )
+
+    test_pts: List[CurvePoint] = []
+    save_pts: List[CurvePoint] = []
+
+    for i, p in enumerate(stock_points):
+        if i < anchor_idx:
+            if i == bin_idx:
+                # Bin under test: apply the OC gain.
+                test_pts.append(CurvePoint(p.voltage_uv, bin_target_freq))
+                save_pts.append(CurvePoint(p.voltage_uv, bin_target_freq))
+            else:
+                # Other sub-anchor bins: last_good (no cap at bin_target_freq).
+                # The GPU will exercise these naturally during ray/matrix load.
+                lg = last_good_points[i]
+                test_pts.append(CurvePoint(lg.voltage_uv, lg.freq_khz))
+                save_pts.append(CurvePoint(lg.voltage_uv, lg.freq_khz))
+        elif i == anchor_idx:
+            # Anchor: use full confirmed OC frequency in BOTH test and save.
+            # This lets frequency-max mode reach anchor_freq for a meaningful score.
+            test_pts.append(CurvePoint(anchor_voltage_uv, anchor_freq_khz))
+            save_pts.append(CurvePoint(anchor_voltage_uv, anchor_freq_khz))
+        else:
+            # Above anchor: stock voltage, capped at anchor_freq in both curves.
+            test_pts.append(CurvePoint(p.voltage_uv, min(p.freq_khz, anchor_freq_khz)))
+            save_pts.append(CurvePoint(p.voltage_uv, min(p.freq_khz, anchor_freq_khz)))
+
+    return test_pts, save_pts
 
 
 # ----------------------------
@@ -468,13 +586,20 @@ def run_doloming(
     log_path: Path,
     abort_event: threading.Event,
     stress_timeout: Optional[int] = None,
+    max_freq_mhz: int = 0,
 ) -> Tuple[int, str]:
     exe_is_py = doloming_path.lower().endswith(".py")
     base_cmd = [sys.executable, doloming_path] if exe_is_py else [doloming_path]
 
+    # For frequency-max mode pass the target ceiling so doloMing's Score_gamma
+    # and Avg/Max ratio are computed against the actual test freq, not the
+    # GPU's absolute silicon max (e.g. 2010 MHz anchor vs 2100 MHz hardware max).
+    _freq_args = (["--max-freq-mhz", str(max_freq_mhz)]
+                  if mode == "frequency-max" and max_freq_mhz > 0 else [])
+
     candidates = [
-        base_cmd + ["--mode", mode, "--seconds", str(seconds)],
-        base_cmd + [mode, str(seconds)],
+        base_cmd + ["--mode", mode, "--seconds", str(seconds)] + _freq_args,
+        base_cmd + [mode, str(seconds)] + _freq_args,
     ]
 
     last_output = ""
@@ -494,9 +619,19 @@ def run_doloming(
                     raise KeyboardInterrupt("User pressed Ctrl+C")
                 if abort_event.is_set():
                     terminate_process_tree(p)
+                    reader.join(timeout=3.0)
+                    log_path.write_text(
+                        "".join(output_lines) + "\n--- TRUNCATED (killed by monitor abort) ---\n",
+                        encoding="utf-8", errors="replace",
+                    )
                     return (999, "ABORTED_BY_MONITOR")
                 if deadline and time.time() > deadline:
                     terminate_process_tree(p)
+                    reader.join(timeout=3.0)
+                    log_path.write_text(
+                        "".join(output_lines) + "\n--- TRUNCATED (killed by VoltVandal stress-timeout) ---\n",
+                        encoding="utf-8", errors="replace",
+                    )
                     return (998, "STRESS_TIMEOUT")
                 reader_done.wait(timeout=0.25)
         finally:
@@ -574,12 +709,56 @@ def run_gpuburn(
 @dataclass
 class MonitorSnapshot:
     temp_c: int
-    hotspot_c: float  # real NvAPI hotspot, or estimated (edge + offset)
+    hotspot_c: float          # real NvAPI hotspot, or estimated (edge + offset)
     vram_junction_c: Optional[float]  # real NvAPI VRAM junction, or None
     power_w: float
     clock_mhz: int
+    mem_clock_mhz: int        # GPU memory clock
     util_gpu: int
     throttle_reasons: int
+    voltage_mv: Optional[int] = None   # core voltage via NvAPI if available
+    pstate: Optional[int] = None       # current P-state (0=P0 max perf, 8=P8 idle)
+    perf_decrease: Optional[int] = None  # NvAPI_GPU_GetPerfDecreaseInfo bitmask
+    topo_gpu_mw: Optional[int] = None  # GPU die power in mW (power topology)
+    topo_total_mw: Optional[int] = None  # total board power in mW (power topology)
+
+
+# ----------------------------
+# GPU driver-reset (TDR) detection
+# ----------------------------
+# A real GPU TDR collapses the graphics clock to base-clock territory in a
+# single poll interval — the driver resets the device and all P-state/clock
+# machinery drops instantly.  This is a hardware-observable fact, not a
+# utilisation heuristic:
+#   • _TDR_MIN_BOOST_MHZ  — clock must reach this before the detector is
+#                           armed (prevents false fires at session start when
+#                           the GPU is still idling).
+#   • _TDR_BASE_CLOCK_MHZ — if armed and clock drops at/below this the
+#                           driver has reset.  600 MHz sits well above the
+#                           typical polling noise floor but well below any
+#                           real boost clock under load.
+_TDR_MIN_BOOST_MHZ:  int = 1200   # arm threshold  — "we are under load"
+_TDR_BASE_CLOCK_MHZ: int = 600    # collapse threshold — "driver just reset"
+
+# NVML throttle-reason bitmask → short human-readable label
+_THROTTLE_LABELS = {
+    0x0000000000000001: "Idle",
+    0x0000000000000002: "AppClk",
+    0x0000000000000004: "PwrCap",
+    0x0000000000000008: "HwSlowdn",
+    0x0000000000000010: "SyncBst",
+    0x0000000000000020: "SwTherm",
+    0x0000000000000040: "HwTherm",
+    0x0000000000000080: "PwrBrake",
+    0x0000000000000100: "DispClk",
+}
+
+def _decode_throttle(reasons: int) -> str:
+    """Return a compact string describing active NVML throttle reasons."""
+    if reasons == 0:
+        return ""
+    active = [lbl for bit, lbl in _THROTTLE_LABELS.items() if reasons & bit]
+    return "+".join(active) if active else f"0x{reasons:X}"
 
 
 class NvmlMonitor:
@@ -593,6 +772,7 @@ class NvmlMonitor:
         power_limit_w: float,
         abort_on_throttle: bool,
         log_csv: Path,
+        live_display: bool = True,
     ):
         self.gpu_index = gpu_index
         self.poll_seconds = poll_seconds
@@ -602,6 +782,8 @@ class NvmlMonitor:
         self.power_limit_w = power_limit_w
         self.abort_on_throttle = abort_on_throttle
         self.log_csv = log_csv
+        self.live_display = live_display
+        self._live_line_len: int = 0  # track printed width so we can erase cleanly
 
         self.stop_event = threading.Event()
         self.abort_event = threading.Event()
@@ -613,6 +795,10 @@ class NvmlMonitor:
         self.any_throttle: bool = False
         self.last_snapshot: Optional[MonitorSnapshot] = None
         self._consecutive_errors: int = 0
+
+        # GPU driver-reset (TDR) detection state
+        self.driver_reset_detected: bool = False
+        self._had_boost_clock: bool = False  # True once clock ≥ _TDR_MIN_BOOST_MHZ
 
     def start(self) -> None:
         if pynvml is None:
@@ -636,8 +822,14 @@ class NvmlMonitor:
                         "vram_junction_c",
                         "power_w",
                         "clock_mhz",
+                        "mem_clock_mhz",
                         "util_gpu",
+                        "voltage_mv",
                         "throttle_reasons",
+                        "pstate",
+                        "perf_decrease",
+                        "topo_gpu_mw",
+                        "topo_total_mw",
                     ]
                 )
 
@@ -658,14 +850,25 @@ class NvmlMonitor:
                         self.handle, pynvml.NVML_CLOCK_GRAPHICS
                     )
                 )
+                mem_clock = int(
+                    pynvml.nvmlDeviceGetClockInfo(
+                        self.handle, pynvml.NVML_CLOCK_MEM
+                    )
+                )
                 util = int(pynvml.nvmlDeviceGetUtilizationRates(self.handle).gpu)
                 throttle = int(
                     pynvml.nvmlDeviceGetCurrentClocksThrottleReasons(self.handle)
                 )
 
-                # Read real hotspot/VRAM temps via NvAPI if available
+                # ── NvAPI supplemental readings ───────────────────────────────
                 hotspot: float = temp + self.hotspot_offset_c  # fallback estimate
                 vram_junc: Optional[float] = None
+                voltage_mv: Optional[int] = None
+                pstate: Optional[int] = None
+                perf_decrease: Optional[int] = None
+                topo_gpu_mw: Optional[int] = None
+                topo_total_mw: Optional[int] = None
+
                 if _nvapi_native is not None:
                     try:
                         thr = _nvapi_native.get_thermal_sensors(self.gpu_index)
@@ -674,8 +877,30 @@ class NvmlMonitor:
                         vram_junc = thr.get("vram_junction_c")
                     except Exception:
                         pass  # fall back to estimate
+                    try:
+                        voltage_mv = _nvapi_native.get_current_voltage_mv(self.gpu_index)
+                    except Exception:
+                        pass
+                    try:
+                        pstate = _nvapi_native.get_current_pstate(self.gpu_index)
+                    except Exception:
+                        pass
+                    try:
+                        perf_decrease = _nvapi_native.get_perf_decrease_info(self.gpu_index)
+                    except Exception:
+                        pass
+                    try:
+                        topo = _nvapi_native.get_power_topology_mw(self.gpu_index)
+                        if topo:
+                            topo_gpu_mw   = topo.get("gpu_mw")
+                            topo_total_mw = topo.get("total_mw")
+                    except Exception:
+                        pass
 
-                snap = MonitorSnapshot(temp, hotspot, vram_junc, power, clock, util, throttle)
+                snap = MonitorSnapshot(
+                    temp, hotspot, vram_junc, power, clock, mem_clock, util, throttle,
+                    voltage_mv, pstate, perf_decrease, topo_gpu_mw, topo_total_mw,
+                )
                 self.last_snapshot = snap
 
                 self.max_temp = (
@@ -690,14 +915,56 @@ class NvmlMonitor:
                 if throttle != 0:
                     self.any_throttle = True
 
-                vram_str = f"{vram_junc:.1f}" if vram_junc is not None else ""
+                # ── CSV logging ───────────────────────────────────────────────
+                vram_str    = f"{vram_junc:.1f}" if vram_junc is not None else ""
+                volt_str    = str(voltage_mv)   if voltage_mv is not None else ""
+                pstate_str  = str(pstate)        if pstate    is not None else ""
+                pdec_str    = f"0x{perf_decrease:X}" if perf_decrease is not None else ""
+                gpu_mw_str  = str(topo_gpu_mw)  if topo_gpu_mw   is not None else ""
+                tot_mw_str  = str(topo_total_mw) if topo_total_mw is not None else ""
                 with self.log_csv.open("a", newline="") as f:
                     w = csv.writer(f)
                     w.writerow(
                         [now_utc_iso(), temp, f"{hotspot:.1f}", vram_str,
-                         f"{power:.1f}", clock, util, throttle]
+                         f"{power:.1f}", clock, mem_clock, util, volt_str, throttle,
+                         pstate_str, pdec_str, gpu_mw_str, tot_mw_str]
                     )
 
+                # ── Live display ──────────────────────────────────────────────
+                if self.live_display:
+                    parts = [
+                        f"GPU {temp}°C",
+                        f"Hot {hotspot:.0f}°C",
+                    ]
+                    if vram_junc is not None:
+                        parts.append(f"VRAMJnc {vram_junc:.0f}°C")
+                    if pstate is not None:
+                        parts.append(f"P{pstate}")
+                    parts += [
+                        f"Core {clock} MHz",
+                        f"Mem {mem_clock} MHz",
+                        f"Load {util}%",
+                    ]
+                    if voltage_mv is not None:
+                        parts.append(f"Volt {voltage_mv} mV")
+                    if topo_total_mw is not None:
+                        parts.append(f"BrdPwr {topo_total_mw/1000:.1f}W")
+                    elif topo_gpu_mw is not None:
+                        parts.append(f"GPUPwr {topo_gpu_mw/1000:.1f}W")
+                    else:
+                        parts.append(f"Pwr {power:.0f}W")
+                    throttle_lbl = _decode_throttle(throttle)
+                    if throttle_lbl and throttle_lbl != "Idle":
+                        parts.append(f"Throt:{throttle_lbl}")
+                    if self.driver_reset_detected:
+                        parts.append("!! DRIVER RESET !!")
+                    line = "  " + "  |  ".join(parts)
+                    # Pad to fixed width so previous longer lines are fully erased
+                    self._live_line_len = max(self._live_line_len, len(line))
+                    sys.stderr.write(f"\r{line:<{self._live_line_len}}")
+                    sys.stderr.flush()
+
+                # ── Abort checks ──────────────────────────────────────────────
                 if temp >= self.temp_limit_c:
                     self.abort_event.set()
                 if self.hotspot_limit_c is not None and hotspot >= self.hotspot_limit_c:
@@ -705,6 +972,22 @@ class NvmlMonitor:
                 if power >= self.power_limit_w:
                     self.abort_event.set()
                 if self.abort_on_throttle and throttle != 0:
+                    self.abort_event.set()
+
+                # ── GPU driver-reset (TDR) detection ──────────────────────────
+                # Arm once we've seen the GPU under load; then a clock collapse
+                # to base-clock territory is an unambiguous driver reset signal.
+                if clock >= _TDR_MIN_BOOST_MHZ:
+                    self._had_boost_clock = True
+                if (self._had_boost_clock
+                        and clock <= _TDR_BASE_CLOCK_MHZ
+                        and not self.driver_reset_detected):
+                    self.driver_reset_detected = True
+                    eprint(
+                        f"\n  !! GPU DRIVER RESET (TDR): clock collapsed to "
+                        f"{clock} MHz after boost — GPU driver has reset. "
+                        f"Aborting test and marking FAIL."
+                    )
                     self.abort_event.set()
 
             except Exception as e:
@@ -722,6 +1005,9 @@ class NvmlMonitor:
         self.stop_event.set()
         if self.thread:
             self.thread.join(timeout=5.0)
+        if self.live_display and self._live_line_len > 0:
+            sys.stderr.write("\r" + " " * (self._live_line_len + 2) + "\r")
+            sys.stderr.flush()
             if self.thread.is_alive():
                 # Thread didn't exit in time; skip nvmlShutdown to avoid calling
                 # NVML from the main thread while the monitor thread may still be using it.
@@ -765,10 +1051,157 @@ def load_session(out_dir: Path) -> SessionState:
 
 
 # ----------------------------
+# GPU power limit helpers
+# ----------------------------
+def nvml_read_default_power_w(gpu_index: int) -> Optional[float]:
+    """Return the GPU's factory default TDP in watts via NVML, or None."""
+    if pynvml is None:
+        return None
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        return float(pynvml.nvmlDeviceGetPowerManagementDefaultLimit(handle)) / 1000.0
+    except Exception:
+        return None
+
+
+def nvml_apply_power_limit(gpu_index: int, target_w: float) -> bool:
+    """Set GPU power limit to target_w watts.  Returns True on success."""
+    if pynvml is None:
+        return False
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        pynvml.nvmlDeviceSetPowerManagementLimit(handle, int(target_w * 1000))
+        return True
+    except Exception as e:
+        eprint(f"[power-limit] Failed to apply {target_w:.0f}W: {e}")
+        return False
+
+
+def nvml_restore_power_limit(gpu_index: int, original_w: float) -> None:
+    """Restore GPU power limit to original_w watts (best-effort)."""
+    if pynvml is None:
+        return
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        pynvml.nvmlDeviceSetPowerManagementLimit(handle, int(original_w * 1000))
+    except Exception as e:
+        eprint(f"[power-limit] Failed to restore {original_w:.0f}W: {e}")
+
+
+# ----------------------------
+# VF curve plot
+# ----------------------------
+def plot_vf_curve(
+    stock_csv: Path,
+    last_good_csv: Path,
+    out_path: Path,
+) -> Optional[Path]:
+    """
+    Generate a VF curve PNG comparing stock vs last-good curve.
+    Returns the output path on success, None if matplotlib is unavailable or
+    either CSV is missing.
+    """
+    if not _matplotlib_available:
+        return None
+    if not stock_csv.exists() or not last_good_csv.exists():
+        return None
+
+    def _load(p: Path):
+        import csv as _csv
+        rows = []
+        with p.open(newline="") as f:
+            for row in _csv.reader(f):
+                if len(row) >= 2:
+                    try:
+                        rows.append((int(row[0]) / 1000, int(row[1]) / 1000))  # µV→mV, kHz→MHz
+                    except ValueError:
+                        pass  # skip header / non-numeric
+        return rows
+
+    stock = _load(stock_csv)
+    last_good = _load(last_good_csv)
+    if not stock or not last_good:
+        return None
+
+    s_v, s_f = zip(*stock)
+    g_v, g_f = zip(*last_good)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    ax.plot(s_v, s_f, color="silver", linestyle="--", linewidth=1.5, label="Stock curve")
+    ax.plot(g_v, g_f, color="#2196F3", linewidth=2, label="Last-good (tuned)")
+
+    # Shade the difference between the two curves
+    import numpy as np  # type: ignore
+    common_v = sorted(set(s_v) | set(g_v))
+    s_interp = np.interp(common_v, s_v, s_f)
+    g_interp = np.interp(common_v, g_v, g_f)
+    ax.fill_between(
+        common_v, s_interp, g_interp,
+        where=(g_interp >= s_interp), alpha=0.15, color="#4CAF50", label="Freq gain (OC)"
+    )
+    ax.fill_between(
+        common_v, s_interp, g_interp,
+        where=(g_interp < s_interp), alpha=0.15, color="#F44336", label="Freq reduction"
+    )
+
+    ax.set_xlabel("Voltage (mV)")
+    ax.set_ylabel("Frequency (MHz)")
+    ax.set_title("VoltVandal — VF Curve Comparison")
+    ax.legend(loc="lower right")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(out_path), dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+# ----------------------------
+# doloMing output metric parsing
+# ----------------------------
+def _parse_doloming_stability(out_text: str, mode: str) -> Tuple[bool, Optional[str]]:
+    """
+    Parse doloMing stdout for actual error conditions in the Test Summary.
+
+    IMPORTANT: "Unstable" and "Successfully maintain" are per-sample progress
+    bar labels printed every ~100 ms while the test runs (they reflect whether
+    the current utilisation sample is within tolerance of the 50% target).
+    They are NOT final verdicts and appear in the output of every run —
+    searching the full text for "Unstable" would produce a false FAIL on any
+    run where utilisation ever deviated from target, which is essentially all
+    of them.
+
+    The doloMing Test Summary section (after "Test Summary:") never contains
+    "Unstable".  Real failures are reported as:
+        "Error during stress test: <exc>"   (ray / simple modes)
+        "Error during test: <exc>"          (matrix / frequency-max modes)
+    in the summary when an uncaught exception terminated the workload.
+
+    Returns (is_stable, reason_if_unstable).
+    """
+    mode_key = mode.upper().replace("-", "_")
+
+    # Only inspect the Test Summary section — progress bars are noise.
+    summary_idx = out_text.rfind("Test Summary:")
+    scan_text = out_text[summary_idx:] if summary_idx >= 0 else out_text
+
+    if re.search(r"Error during (?:stress )?test:", scan_text, re.I):
+        return False, f"DOLOMING_{mode_key}_STRESS_ERROR"
+
+    return True, None
+
+
+# ----------------------------
 # Candidate evaluation
 # ----------------------------
 def evaluate_candidate(
-    state: SessionState, candidate_csv: Path, candidate_label: str
+    state: SessionState,
+    candidate_csv: Path,
+    candidate_label: str,
+    max_freq_mhz: int = 0,
 ) -> CandidateResult:
     out_dir = Path(state.out_dir)
     logs_dir = out_dir / "logs"
@@ -797,6 +1230,7 @@ def evaluate_candidate(
             power_limit_w=state.power_limit_w,
             abort_on_throttle=state.abort_on_throttle,
             log_csv=monitor_log,
+            live_display=state.live_display,
         )
         monitor.start()
         abort_event = monitor.abort_event
@@ -812,6 +1246,12 @@ def evaluate_candidate(
         _run_modes = _multi_modes if _use_multi else [state.doloming_mode]
         _secs_each = state.multi_stress_seconds if _use_multi else state.stress_seconds
 
+        # Effective hard timeout: user value if set, otherwise 5× the requested
+        # test duration, with a floor of 300s to absorb long warm-up phases
+        # (e.g. doloMing ray mode never stabilises at 50% on high-end GPUs and
+        # can spend 2–3 minutes in warm-up before the timed test even starts).
+        _dolo_timeout = state.stress_timeout if state.stress_timeout is not None else max(_secs_each * 5, 300)
+
         for _mode in _run_modes:
             dololog = logs_dir / f"{candidate_label}_doloming_{_mode}.log"
             rc, out_text = run_doloming(
@@ -821,16 +1261,30 @@ def evaluate_candidate(
                 None,
                 dololog,
                 abort_event,
-                stress_timeout=state.stress_timeout,
+                stress_timeout=_dolo_timeout,
+                max_freq_mhz=max_freq_mhz,
             )
             _key = f"doloming_{_mode}" if _use_multi else "doloming"
             stress_exit_codes[_key] = rc
             if rc != 0:
                 if monitor:
                     monitor.stop()
+                if rc == 998:
+                    _src = "explicit --stress-timeout" if state.stress_timeout is not None else "auto (5× test duration)"
+                    print(
+                        f"\n  [STRESS_TIMEOUT] doloMing '{_mode}' was killed after "
+                        f"{_dolo_timeout}s (timeout source: {_src}; "
+                        f"test requested {_secs_each}s).\n"
+                        f"  The stress tool's warm-up phase likely exceeded the timeout.\n"
+                        f"  Fix: pass --stress-timeout with a larger value, "
+                        f"or remove it to use auto (5× = {_secs_each * 5}s).\n"
+                    )
+                    _reason = f"DOLOMING_{_mode.upper().replace('-', '_')}_STRESS_TIMEOUT"
+                else:
+                    _reason = f"DOLOMING_{_mode.upper().replace('-', '_')}_RC_{rc}"
                 return CandidateResult(
                     False,
-                    f"DOLOMING_{_mode.upper().replace('-', '_')}_RC_{rc}",
+                    _reason,
                     monitor.max_temp if monitor else None,
                     monitor.max_power if monitor else None,
                     monitor.any_throttle if monitor else None,
@@ -851,20 +1305,46 @@ def evaluate_candidate(
                     monitor.any_throttle if monitor else None,
                     stress_exit_codes,
                 )
+            # Parse doloMing's own stability verdict ("Successfully maintain" / "Unstable").
+            _stable, _instability_reason = _parse_doloming_stability(out_text, _mode)
+            if not _stable:
+                if monitor:
+                    monitor.stop()
+                return CandidateResult(
+                    False,
+                    _instability_reason,
+                    monitor.max_temp if monitor else None,
+                    monitor.max_power if monitor else None,
+                    monitor.any_throttle if monitor else None,
+                    stress_exit_codes,
+                )
 
     if state.gpuburn:
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
+        _burn_timeout = state.stress_timeout if state.stress_timeout is not None else state.stress_seconds * 5
         rc, out_text, parsed_ok = run_gpuburn(
             state.gpuburn, state.stress_seconds, None, burnlog, abort_event,
-            stress_timeout=state.stress_timeout,
+            stress_timeout=_burn_timeout,
         )
         stress_exit_codes["gpuburn"] = rc
         if rc != 0:
             if monitor:
                 monitor.stop()
+            if rc == 998:
+                _src = "explicit --stress-timeout" if state.stress_timeout is not None else "auto (5× test duration)"
+                print(
+                    f"\n  [STRESS_TIMEOUT] gpu-burn was killed after "
+                    f"{_burn_timeout}s (timeout source: {_src}; "
+                    f"test requested {state.stress_seconds}s).\n"
+                    f"  Fix: pass --stress-timeout with a larger value, "
+                    f"or remove it to use auto (5× = {state.stress_seconds * 5}s).\n"
+                )
+                _burn_reason = "GPUBURN_STRESS_TIMEOUT"
+            else:
+                _burn_reason = f"GPUBURN_RC_{rc}"
             return CandidateResult(
                 False,
-                f"GPUBURN_RC_{rc}",
+                _burn_reason,
                 monitor.max_temp if monitor else None,
                 monitor.max_power if monitor else None,
                 monitor.any_throttle if monitor else None,
@@ -896,9 +1376,14 @@ def evaluate_candidate(
     if monitor:
         if monitor.abort_event.is_set():
             monitor.stop()
+            _abort_reason = (
+                "GPU_DRIVER_RESET_DETECTED"
+                if monitor.driver_reset_detected
+                else "MONITOR_ABORT_THRESHOLD"
+            )
             return CandidateResult(
                 False,
-                "MONITOR_ABORT_THRESHOLD",
+                _abort_reason,
                 monitor.max_temp,
                 monitor.max_power,
                 monitor.any_throttle,
@@ -931,14 +1416,16 @@ def run_vlock_session(state: SessionState) -> None:
                   stock in +step_mhz increments until the stress test fails.
                   The last passing frequency becomes the anchor.
 
-    Phase 2 (UV): With the anchor fixed at (anchor_v, peak_f), reduce the
-                  voltage of every bin BELOW the anchor by step_mv per round.
-                  Tests the whole sub-anchor range at once each round — stops
-                  when it fails, backs off one step.
+    Phase 2 (OC shift): Apply the same frequency gain from Phase 1 to each
+                  sub-anchor bin (highest first), keeping stock voltages.
+                  Each bin is tested individually with the GPU capped at its
+                  shifted frequency.  Passing bins keep the gain; failing
+                  bins are left at stock.  Above-anchor bins are clamped at
+                  anchor_freq_khz in the saved curve.
 
     Produces a curve that:
       - Maximises clock speed at the chosen voltage (anchor point)
-      - Minimises voltage for all lower-frequency bins (sub-anchor range)
+      - Extends the same OC gain to lower-voltage bins where silicon allows
     This matches the classic MSI Afterburner undervolt shape.
     """
     out_dir = Path(state.out_dir)
@@ -957,18 +1444,28 @@ def run_vlock_session(state: SessionState) -> None:
     anchor_v_mv = anchor_v_uv // 1000
     anchor_stock_f_khz = stock_points[anchor_idx].freq_khz
 
+    # OC-phase base frequency: normally stock, but may be lowered by floor-search
+    # if the stock clock is unstable at the chosen voltage.  Persisted so resumes
+    # after a floor-search start from the correct base frequency.
+    oc_base_freq_khz = state.vlock_oc_base_freq_khz if state.vlock_oc_base_freq_khz else anchor_stock_f_khz
+
     if anchor_v_mv != state.vlock_target_mv:
         print(
             f"[vlock] Note: no bin at {state.vlock_target_mv} mV — "
             f"using nearest bin at {anchor_v_mv} mV."
         )
 
+    _start_freq_note = (
+        f"  OC start freq  : {state.vlock_start_freq_mhz} MHz  (baseline will be skipped)\n"
+        if state.vlock_start_freq_mhz > 0 else ""
+    )
     print(
         f"\n=== VoltVandal — vlock mode ===\n"
         f"  Anchor voltage : {anchor_v_mv} mV  "
         f"(stock freq at this bin: {anchor_stock_f_khz // 1000} MHz)\n"
         f"  Bins below anchor: {anchor_idx}  "
         f"(indices 0 … {max(anchor_idx - 1, 0)})\n"
+        f"{_start_freq_note}"
         f"  Resuming at phase : {state.vlock_phase}\n"
     )
 
@@ -981,8 +1478,33 @@ def run_vlock_session(state: SessionState) -> None:
                             "label": label, **extra}) + "\n"
             )
 
+    # Pre-compute a human-readable stress duration label used in both phase banners.
+    _dolo_multi_modes = [m.strip() for m in (state.doloming_modes or "").split(",") if m.strip()]
+    if _dolo_multi_modes:
+        _stress_label = (
+            f"{state.multi_stress_seconds}s × {len(_dolo_multi_modes)} modes"
+            f" = {state.multi_stress_seconds * len(_dolo_multi_modes)}s total"
+        )
+    else:
+        _stress_label = f"{state.stress_seconds}s"
+
     # ── Phase 1: OC search at anchor voltage ─────────────────────────────────
     if state.vlock_phase == "oc":
+
+        # If --start-freq-mhz was given, skip the baseline and jump straight to
+        # the requested step.  The value is rounded to the nearest step-mhz
+        # boundary above stock; stock is assumed stable (user's responsibility).
+        if state.vlock_start_freq_mhz > 0 and state.current_step == 0:
+            _sf_khz   = mhz_to_khz(state.vlock_start_freq_mhz)
+            _sf_step  = max(1, round((_sf_khz - anchor_stock_f_khz) / mhz_to_khz(state.step_mhz)))
+            _sf_actual = (anchor_stock_f_khz + mhz_to_khz(state.step_mhz * _sf_step)) // 1000
+            print(
+                f"  Baseline skipped (--start-freq-mhz {state.vlock_start_freq_mhz} MHz).\n"
+                f"  Starting OC search at step {_sf_step}: {_sf_actual} MHz.\n"
+            )
+            state.vlock_anchor_freq_khz = anchor_stock_f_khz
+            state.current_step = _sf_step
+            save_session(state)
 
         # Step 0: verify that stock frequency at the target voltage is stable.
         # This is the minimum bar — if it fails the voltage is simply too low.
@@ -997,25 +1519,91 @@ def run_vlock_session(state: SessionState) -> None:
                 f"\n== {label} ==\n"
                 f"  Verifying stock frequency at anchor voltage before stepping up.\n"
             )
-            result = evaluate_candidate(state, cand_csv, label)
+            result = evaluate_candidate(state, cand_csv, label,
+                                        max_freq_mhz=anchor_stock_f_khz // 1000)
             _log(result, label, {"phase": "oc", "anchor_v_mv": anchor_v_mv,
                                  "freq_khz": anchor_stock_f_khz, "uv_offset_mv": 0})
             print(f"Result: {'PASS' if result.ok else 'FAIL'} | {result.reason}")
 
             if not result.ok:
-                revert_to_last_good(state)
+                # Auto floor-search: step frequency DOWN from stock until stable.
+                # The first passing frequency becomes the OC-phase base for Phase 1.
                 print(
-                    f"\nFAIL: Stock frequency ({anchor_stock_f_khz // 1000} MHz) is "
-                    f"unstable at {anchor_v_mv} mV.\n"
-                    f"  → Try a higher --target-voltage-mv (e.g. {anchor_v_mv + 13} mV)."
+                    f"\n  Stock frequency ({anchor_stock_f_khz // 1000} MHz) is unstable at "
+                    f"{anchor_v_mv} mV.\n"
+                    f"  Auto-searching for highest stable frequency "
+                    f"(stepping down {state.step_mhz} MHz per trial, "
+                    f"up to {state.max_steps} steps)...\n"
                 )
-                return
+                floor_found = False
+                for _ds in range(1, state.max_steps + 1):
+                    if _interrupted.is_set():
+                        revert_to_last_good(state)
+                        raise KeyboardInterrupt("User pressed Ctrl+C")
+                    _floor_f_khz = anchor_stock_f_khz - mhz_to_khz(state.step_mhz * _ds)
+                    if _floor_f_khz <= 0:
+                        break
+                    _cand_pts = _build_vlock_curve(
+                        stock_points, anchor_idx, anchor_v_uv, _floor_f_khz, 0
+                    )
+                    write_curve_csv(cand_csv, _cand_pts)
+                    _floor_label = (
+                        f"vlock_floor_step{_ds:03d}_{anchor_v_mv}mv"
+                        f"_{_floor_f_khz // 1000}mhz"
+                        f"_minus{state.step_mhz * _ds}mhz"
+                    )
+                    print(
+                        f"\n== Floor search — {_floor_label} ==\n"
+                        f"  Testing: {anchor_v_mv} mV  @  {_floor_f_khz // 1000} MHz  "
+                        f"(−{state.step_mhz * _ds} MHz vs stock)\n"
+                    )
+                    _fres = evaluate_candidate(state, cand_csv, _floor_label,
+                                               max_freq_mhz=_floor_f_khz // 1000)
+                    _log(_fres, _floor_label, {
+                        "phase": "floor_search",
+                        "anchor_v_mv": anchor_v_mv,
+                        "freq_khz": _floor_f_khz,
+                        "delta_mhz": -(state.step_mhz * _ds),
+                        "uv_offset_mv": 0,
+                    })
+                    print(f"Result: {'PASS' if _fres.ok else 'FAIL'} | {_fres.reason}")
+                    if _fres.ok:
+                        oc_base_freq_khz = _floor_f_khz
+                        floor_found = True
+                        shutil.copyfile(cand_csv, last_good_csv)
+                        state.vlock_anchor_freq_khz = oc_base_freq_khz
+                        state.vlock_oc_base_freq_khz = oc_base_freq_khz
+                        state.current_step = 0
+                        save_session(state)
+                        print(
+                            f"\n  Stable floor found: {anchor_v_mv} mV @ "
+                            f"{oc_base_freq_khz // 1000} MHz  "
+                            f"(−{state.step_mhz * _ds} MHz vs stock)\n"
+                            f"  Continuing Phase 1 OC sweep upward from this baseline...\n"
+                        )
+                        break
 
-            # Baseline passed: record stock freq as current best anchor.
-            state.vlock_anchor_freq_khz = anchor_stock_f_khz
-            shutil.copyfile(cand_csv, last_good_csv)
-            state.current_step = 0   # step 0 done; loop below starts at 1
-            save_session(state)
+                if not floor_found:
+                    revert_to_last_good(state)
+                    _lowest_mhz = max(
+                        (anchor_stock_f_khz - mhz_to_khz(state.step_mhz * state.max_steps)) // 1000,
+                        0,
+                    )
+                    print(
+                        f"\nFAIL: No stable frequency found at {anchor_v_mv} mV "
+                        f"(tested down to {_lowest_mhz} MHz).\n"
+                        f"  → Try a higher --target-voltage-mv "
+                        f"(e.g. {anchor_v_mv + 13} mV).\n"
+                    )
+                    return
+
+            else:
+                # Baseline passed: record stock freq as current best anchor.
+                state.vlock_anchor_freq_khz = anchor_stock_f_khz
+                state.vlock_oc_base_freq_khz = 0  # 0 signals "use stock" on resume
+                shutil.copyfile(cand_csv, last_good_csv)
+                state.current_step = 0   # step 0 done; loop below starts at 1
+                save_session(state)
 
         # Steps 1+: step frequency up until failure.
         oc_step = max(state.current_step, 1)
@@ -1025,12 +1613,16 @@ def run_vlock_session(state: SessionState) -> None:
                 revert_to_last_good(state)
                 raise KeyboardInterrupt("User pressed Ctrl+C")
 
-            freq_khz = anchor_stock_f_khz + mhz_to_khz(state.step_mhz * oc_step)
+            freq_khz = oc_base_freq_khz + mhz_to_khz(state.step_mhz * oc_step)
             cand_pts = _build_vlock_curve(
                 stock_points, anchor_idx, anchor_v_uv, freq_khz, 0
             )
             cand_csv = out_dir / "candidate.csv"
             write_curve_csv(cand_csv, cand_pts)
+            _base_label = (
+                "stock" if oc_base_freq_khz == anchor_stock_f_khz
+                else f"floor+{state.step_mhz * oc_step}"
+            )
             label = (
                 f"vlock_oc_step{oc_step:03d}_{anchor_v_mv}mv"
                 f"_{freq_khz // 1000}mhz"
@@ -1039,11 +1631,12 @@ def run_vlock_session(state: SessionState) -> None:
             print(
                 f"\n== Phase 1 — {label} ==\n"
                 f"  Anchor: {anchor_v_mv} mV  @  {freq_khz // 1000} MHz  "
-                f"(+{state.step_mhz * oc_step} MHz vs stock)\n"
-                f"  Stress: {state.stress_seconds}s\n"
+                f"(+{state.step_mhz * oc_step} MHz vs {_base_label})\n"
+                f"  Stress: {_stress_label}\n"
             )
 
-            result = evaluate_candidate(state, cand_csv, label)
+            result = evaluate_candidate(state, cand_csv, label,
+                                        max_freq_mhz=freq_khz // 1000)
             _log(result, label, {"phase": "oc", "anchor_v_mv": anchor_v_mv,
                                  "freq_khz": freq_khz,
                                  "delta_mhz": state.step_mhz * oc_step,
@@ -1078,92 +1671,198 @@ def run_vlock_session(state: SessionState) -> None:
             state.current_step = 0
             save_session(state)
 
-    # ── Phase 2: UV sweep below anchor ───────────────────────────────────────
+    # ── Phase 2: per-bin UV sweep below anchor ────────────────────────────────
     if state.vlock_phase == "uv":
         if state.vlock_anchor_freq_khz == 0:
             state.vlock_anchor_freq_khz = anchor_stock_f_khz   # safety fallback
 
+        # OC gain achieved in Phase 1: the extra MHz confirmed at the anchor voltage.
+        oc_gain_khz = state.vlock_anchor_freq_khz - anchor_stock_f_khz
+
         if anchor_idx == 0:
-            print("Anchor is the lowest voltage bin — no bins to undervolt. Done.")
+            print("Anchor is the lowest voltage bin — no sub-anchor bins to shift. Done.")
+            state.vlock_phase = "done"
+            save_session(state)
+        elif oc_gain_khz <= 0:
+            print(
+                "Anchor frequency equals stock — no OC gain to apply to sub-anchor bins.\n"
+                "Phase 2 skipped."
+            )
             state.vlock_phase = "done"
             save_session(state)
         else:
+            # Initialise outer bin-loop on first entry.
+            if state.vlock_uv_bin_idx == -1:
+                state.vlock_uv_bin_idx = anchor_idx - 1
+                state.current_step = 0
+                save_session(state)
+
             print(
-                f"\nPhase 2 (UV sweep): reducing voltage of {anchor_idx} bin(s) "
-                f"below anchor ({anchor_v_mv} mV @ "
-                f"{state.vlock_anchor_freq_khz // 1000} MHz)\n"
-                f"  Each round: all sub-anchor bins reduced by {state.step_mv} mV\n"
+                f"\nPhase 2 (per-bin OC shift): applying +{oc_gain_khz // 1000} MHz "
+                f"to {anchor_idx} sub-anchor bin(s), tested individually.\n"
+                f"  Anchor gain : {anchor_stock_f_khz // 1000} -> "
+                f"{state.vlock_anchor_freq_khz // 1000} MHz  "
+                f"(+{oc_gain_khz // 1000} MHz at {anchor_v_mv} mV)\n"
+                f"  Sub-anchor  : stock voltages kept; full +{oc_gain_khz // 1000} MHz "
+                f"tried first, steps down {state.step_mhz} MHz on failure.\n"
+                f"  Test method : GPU free to boost up to anchor during stress;\n"
+                f"                ray/matrix exercise sub-anchor bins at ~50% util,\n"
+                f"                frequency-max exercises anchor for a clean score.\n"
+                f"  Stability   : doloMing output metrics (\"Successfully maintain\" /\n"
+                f"                \"Unstable\") used as primary pass/fail signal.\n"
+                f"  Above anchor: clamped at {state.vlock_anchor_freq_khz // 1000} MHz.\n"
             )
 
-            uv_step = state.current_step + 1
-            while uv_step <= state.max_steps:
+            # ── Outer loop: one bin at a time, highest sub-anchor → lowest ────
+            # For each bin we first try the full oc_gain_khz.  On failure we
+            # step the gain down by step_mhz repeatedly until a stable frequency
+            # is found or we exhaust all steps (leaving the bin at stock).
+            step_khz = state.step_mhz * 1000
+
+            while state.vlock_uv_bin_idx >= 0:
                 if _interrupted.is_set():
                     eprint("\nInterrupted — reverting to last known-good curve...")
                     revert_to_last_good(state)
                     raise KeyboardInterrupt("User pressed Ctrl+C")
 
-                uv_offset_mv = state.step_mv * uv_step
-                uv_offset_uv = mv_to_uv(uv_offset_mv)
-                cand_pts = _build_vlock_curve(
-                    stock_points, anchor_idx, anchor_v_uv,
-                    state.vlock_anchor_freq_khz, uv_offset_uv,
-                )
-                cand_csv = out_dir / "candidate.csv"
-                write_curve_csv(cand_csv, cand_pts)
-                label = (
-                    f"vlock_uv_step{uv_step:03d}"
-                    f"_minus{uv_offset_mv}mv_below_anchor"
-                )
+                bin_idx     = state.vlock_uv_bin_idx
+                bin_stock_f = stock_points[bin_idx].freq_khz
+                bin_v_mv    = stock_points[bin_idx].voltage_uv // 1000
+
+                # Initialise gain for this bin on first attempt (or resume).
+                if state.vlock_p2_current_gain_khz <= 0:
+                    state.vlock_p2_current_gain_khz = oc_gain_khz
+
+                current_gain  = state.vlock_p2_current_gain_khz
+                bin_target_f  = min(bin_stock_f + current_gain,
+                                    state.vlock_anchor_freq_khz)
+                bin_actual_gain = bin_target_f - bin_stock_f
+
                 print(
-                    f"\n== Phase 2 — {label} ==\n"
-                    f"  Anchor: {anchor_v_mv} mV  @  "
-                    f"{state.vlock_anchor_freq_khz // 1000} MHz  (locked)\n"
-                    f"  Sub-anchor bins: −{uv_offset_mv} mV on {anchor_idx} bin(s)\n"
-                    f"  Stress: {state.stress_seconds}s\n"
+                    f"\n{'─' * 56}\n"
+                    f"  Phase 2 — bin {bin_idx:2d} :  {bin_v_mv} mV  |  "
+                    f"{bin_stock_f // 1000} -> {bin_target_f // 1000} MHz  "
+                    f"(+{bin_actual_gain // 1000} MHz)\n"
+                    f"{'─' * 56}"
                 )
 
-                result = evaluate_candidate(state, cand_csv, label)
-                _log(result, label, {"phase": "uv", "anchor_v_mv": anchor_v_mv,
-                                     "anchor_freq_khz": state.vlock_anchor_freq_khz,
-                                     "uv_offset_mv": uv_offset_mv})
+                last_good_pts = load_curve_csv(last_good_csv)
+                test_pts, save_pts = _build_vlock_phase2_curves(
+                    stock_points, last_good_pts,
+                    bin_idx, anchor_idx,
+                    anchor_v_uv, state.vlock_anchor_freq_khz,
+                    current_gain,
+                )
+                cand_csv = out_dir / "candidate.csv"
+                write_curve_csv(cand_csv, test_pts)
+                label = (
+                    f"vlock_p2_bin{bin_idx:03d}"
+                    f"_{bin_v_mv}mv"
+                    f"_{bin_target_f // 1000}mhz"
+                )
+                print(
+                    f"\n== Phase 2, bin {bin_idx} ==\n"
+                    f"  Bin    : {bin_v_mv} mV  @  {bin_stock_f // 1000} MHz  "
+                    f"->  {bin_target_f // 1000} MHz  (+{bin_actual_gain // 1000} MHz)\n"
+                    f"  (GPU free to boost up to anchor {state.vlock_anchor_freq_khz // 1000} MHz)\n"
+                    f"  Stress : {_stress_label}\n"
+                )
+
+                result = evaluate_candidate(state, cand_csv, label,
+                                            max_freq_mhz=state.vlock_anchor_freq_khz // 1000)
+                _log(result, label, {
+                    "phase": "p2_oc_shift",
+                    "bin_idx": bin_idx,
+                    "bin_stock_freq_khz": bin_stock_f,
+                    "bin_target_freq_khz": bin_target_f,
+                    "bin_v_mv": bin_v_mv,
+                    "oc_gain_khz": current_gain,
+                    "anchor_v_mv": anchor_v_mv,
+                    "anchor_freq_khz": state.vlock_anchor_freq_khz,
+                })
                 print(f"Result: {'PASS' if result.ok else 'FAIL'} | {result.reason}")
 
                 if result.ok:
-                    state.vlock_uv_offset_mv = uv_offset_mv
-                    shutil.copyfile(cand_csv, last_good_csv)
-                    state.current_step = uv_step
-                    save_session(state)
-                    uv_step += 1
+                    # ── Bin confirmed at current gain ─────────────────────────
+                    state.vlock_uv_offset_mv += 1   # repurpose as confirmed-bin count
+                    write_curve_csv(last_good_csv, save_pts)
+                    backups_dir = out_dir / "curve_backups"
+                    ensure_dir(backups_dir)
+                    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+                    shutil.copyfile(last_good_csv,
+                                    backups_dir / f"good_{label}_{ts}.csv")
+                    print(f"  Bin {bin_idx}: CONFIRMED  "
+                          f"{bin_stock_f // 1000} -> {bin_target_f // 1000} MHz  "
+                          f"(+{bin_actual_gain // 1000} MHz at {bin_v_mv} mV)")
+                    # Move to the next lower bin, reset gain tracker.
+                    state.vlock_uv_bin_idx -= 1
+                    state.vlock_p2_current_gain_khz = 0
+                    state.current_step = 0
                 else:
+                    # ── Bin failed — step gain down and retry ─────────────────
                     revert_to_last_good(state)
-                    print(
-                        f"\n== Phase 2 complete ==\n"
-                        f"  Max UV offset for sub-anchor bins: "
-                        f"−{state.vlock_uv_offset_mv} mV  "
-                        f"(failed at −{uv_offset_mv} mV)\n"
-                    )
-                    state.vlock_phase = "done"
-                    save_session(state)
-                    break
-            else:
-                print(
-                    f"Phase 2 max steps reached — "
-                    f"UV offset: {state.vlock_uv_offset_mv} mV"
-                )
-                state.vlock_phase = "done"
+                    next_gain = current_gain - step_khz
+                    if next_gain > 0:
+                        print(
+                            f"  Bin {bin_idx}: FAILED at +{bin_actual_gain // 1000} MHz "
+                            f"— stepping down to +{next_gain // 1000} MHz"
+                        )
+                        state.vlock_p2_current_gain_khz = next_gain
+                        # Do NOT advance bin_idx — retry this bin at lower gain.
+                    else:
+                        # No more steps possible: leave this bin at stock.
+                        print(
+                            f"  Bin {bin_idx}: FAILED all gains — left at stock "
+                            f"({bin_stock_f // 1000} MHz at {bin_v_mv} mV)"
+                        )
+                        state.vlock_uv_bin_idx -= 1
+                        state.vlock_p2_current_gain_khz = 0
+                        state.current_step = 0
+
                 save_session(state)
+
+            # All bins processed.
+            state.vlock_phase = "done"
+            save_session(state)
 
     # ── Final summary ─────────────────────────────────────────────────────────
     if state.vlock_phase == "done":
+        oc_gain_khz = state.vlock_anchor_freq_khz - anchor_stock_f_khz
+        # Derive per-bin frequency changes by comparing last_good_curve vs stock.
+        confirmed_lines: List[str] = []
+        skipped_lines:   List[str] = []
+        if last_good_csv.exists() and anchor_idx > 0:
+            final_pts = load_curve_csv(last_good_csv)
+            for i in range(anchor_idx):
+                stock_f = stock_points[i].freq_khz // 1000
+                final_f = final_pts[i].freq_khz    // 1000
+                v_mv    = stock_points[i].voltage_uv // 1000
+                if final_f != stock_f:
+                    confirmed_lines.append(
+                        f"    bin {i:2d}: {v_mv:4d} mV  "
+                        f"{stock_f} -> {final_f} MHz  (+{final_f - stock_f} MHz)"
+                    )
+                else:
+                    skipped_lines.append(
+                        f"    bin {i:2d}: {v_mv:4d} mV  "
+                        f"{stock_f} MHz  (left at stock)"
+                    )
+        n_confirmed = len(confirmed_lines)
+        n_total     = anchor_idx
+        all_lines   = confirmed_lines + skipped_lines
+        freq_block  = "\n".join(all_lines) if all_lines else "    (no bins processed)"
+
         print(
-            f"\n{'=' * 52}\n"
+            f"\n{'=' * 56}\n"
             f"  vlock optimisation complete\n"
-            f"{'=' * 52}\n"
+            f"{'=' * 56}\n"
             f"  Anchor  :  {anchor_v_mv} mV  @  "
             f"{state.vlock_anchor_freq_khz // 1000} MHz\n"
-            f"  UV gain :  −{state.vlock_uv_offset_mv} mV on "
-            f"{anchor_idx} sub-anchor bin(s)\n"
-            f"  Curve   :  {last_good_csv}\n"
+            f"  OC gain :  +{oc_gain_khz // 1000} MHz  "
+            f"({n_confirmed}/{n_total} sub-anchor bin(s) confirmed)\n"
+            f"\n  Sub-anchor bins:\n"
+            f"{freq_block}\n"
+            f"\n  Curve   :  {last_good_csv}\n"
             f"\n  To apply on next boot:\n"
             f"    python voltvandal.py restore --out {state.out_dir}\n"
         )
@@ -1326,9 +2025,44 @@ def run_session(state: SessionState) -> None:
 
             state.current_step = step - 1
             save_session(state)
-            print(
-                "Stopped after failure. You can adjust step sizes/limits and resume (it will retry this step)."
-            )
+            _steps_passed = step - 1
+            if _steps_passed == 0:
+                # Failed on the very first step — the starting configuration is already at its limit.
+                if state.mode == "uv":
+                    print(
+                        f"\n== Tuning stopped — step 1 failed ==\n"
+                        f"  The first UV reduction (−{state.step_mv} mV) was already unstable.\n"
+                        f"  Your GPU is at its voltage floor with the current settings.\n"
+                        f"  Options:\n"
+                        f"    • Try smaller --step-mv (e.g. --step-mv 2) for finer granularity.\n"
+                        f"    • Narrow the bin range (--bin-min-mv / --bin-max-mv).\n"
+                        f"    • Run a longer stress (--stress-seconds) to confirm stock is stable.\n"
+                    )
+                elif state.mode == "oc":
+                    print(
+                        f"\n== Tuning stopped — step 1 failed ==\n"
+                        f"  The first OC step (+{state.step_mhz} MHz) was already unstable.\n"
+                        f"  Your GPU is at its clock ceiling with the current voltage.\n"
+                        f"  Options:\n"
+                        f"    • Try smaller --step-mhz (e.g. --step-mhz 5) for finer search.\n"
+                        f"    • Raise voltage range (--bin-min-mv / --bin-max-mv) to allow more headroom.\n"
+                    )
+                else:
+                    print(
+                        f"\n== Tuning stopped — step 1 failed ==\n"
+                        f"  Could not apply even the first adjustment in {state.mode} mode.\n"
+                        f"  Consider smaller step sizes or a different bin range, then resume.\n"
+                    )
+            else:
+                _best_mv = state.current_offset_mv
+                _best_mhz = state.current_offset_mhz
+                print(
+                    f"\n== Tuning stopped — {_steps_passed} step(s) passed, step {step} failed ==\n"
+                    f"  Best result : offset {_best_mv:+d} mV, {_best_mhz:+d} MHz\n"
+                    f"  Last-good curve saved. Resume from here:\n"
+                    f"    python voltvandal.py resume --out {state.out_dir}\n"
+                    f"  (Resume retries step {step} — adjust limits/step sizes if needed.)\n"
+                )
             break
 
 
@@ -1394,20 +2128,68 @@ def build_session_from_args(args: argparse.Namespace) -> SessionState:
         current_offset_mv=0,
         current_offset_mhz=0,
         vlock_target_mv=getattr(args, "target_voltage_mv", 0),
+        vlock_start_freq_mhz=getattr(args, "start_freq_mhz", 0),
         vlock_anchor_freq_khz=0,
         vlock_uv_offset_mv=0,
         vlock_phase="oc",
+        power_limit_pct=getattr(args, "power_limit_pct", 100),
+        live_display=not getattr(args, "no_live_display", False),
+        no_plot=getattr(args, "no_plot", False),
         started_utc=now_utc_iso(),
         updated_utc=now_utc_iso(),
     )
 
 
 def _dispatch_session(state: SessionState) -> None:
-    """Route to the correct tuning loop based on session mode."""
-    if state.mode == "vlock":
-        run_vlock_session(state)
-    else:
-        run_session(state)
+    """Route to the correct tuning loop based on session mode, applying and
+    restoring a GPU power limit if --power-limit-pct was specified."""
+    original_power_w: Optional[float] = None
+
+    if state.power_limit_pct != 100:
+        default_w = nvml_read_default_power_w(state.gpu)
+        if default_w is not None:
+            target_w = default_w * state.power_limit_pct / 100.0
+            max_w    = default_w * 1.15  # hard cap at 115 %
+            target_w = min(target_w, max_w)
+            # Read the *current* limit (may already differ from default) so we
+            # restore exactly what was set before this session ran.
+            try:
+                if pynvml is not None:
+                    pynvml.nvmlInit()
+                    h = pynvml.nvmlDeviceGetHandleByIndex(state.gpu)
+                    original_power_w = float(
+                        pynvml.nvmlDeviceGetPowerManagementLimit(h)
+                    ) / 1000.0
+            except Exception:
+                original_power_w = default_w
+            if nvml_apply_power_limit(state.gpu, target_w):
+                print(
+                    f"[power-limit] Applied {target_w:.0f}W "
+                    f"({state.power_limit_pct}% of {default_w:.0f}W default)"
+                )
+        else:
+            print("[power-limit] Could not read default TDP — power limit unchanged.")
+
+    try:
+        if state.mode == "vlock":
+            run_vlock_session(state)
+        else:
+            run_session(state)
+    finally:
+        if original_power_w is not None:
+            nvml_restore_power_limit(state.gpu, original_power_w)
+            print(f"[power-limit] Restored to {original_power_w:.0f}W")
+
+        # Post-run VF curve plot
+        stock_csv    = Path(state.stock_curve_csv)
+        last_good    = Path(state.last_good_curve_csv)
+        plot_out     = Path(state.out_dir) / "vf_curve_plot.png"
+        if not getattr(state, "no_plot", False):
+            result = plot_vf_curve(stock_csv, last_good, plot_out)
+            if result:
+                print(f"[plot] VF curve saved → {result}")
+            elif not _matplotlib_available:
+                print("[plot] matplotlib not installed — skipping curve plot.  pip install matplotlib")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -1545,6 +2327,38 @@ Write-Output 'REMOVED'"""
 # CLI
 # ----------------------------
 def parse_args() -> argparse.Namespace:
+    # Pre-scan argv for --gpu-profile so we can apply it as defaults before
+    # the full parse (profile values are overridden by any explicit CLI flags).
+    _profile_defaults: dict = {}
+    _pre_profile: Optional[str] = None
+    for _i, _a in enumerate(sys.argv[1:]):
+        if _a == "--gpu-profile" and _i + 2 < len(sys.argv):
+            _pre_profile = sys.argv[_i + 2]
+            break
+        if _a.startswith("--gpu-profile="):
+            _pre_profile = _a.split("=", 1)[1]
+            break
+    if _pre_profile is not None:
+        if _gpu_profiles is None:
+            eprint("ERROR: --gpu-profile requires gpu_profiles.py alongside voltvandal.py.")
+            sys.exit(2)
+        try:
+            _prof = _gpu_profiles.get_profile(_pre_profile)
+        except KeyError as _ke:
+            eprint(f"ERROR: {_ke}")
+            sys.exit(2)
+        _profile_defaults = {
+            k: _prof[k]
+            for k in (
+                "target_voltage_mv", "step_mhz", "step_mv", "max_steps",
+                "stress_seconds", "multi_stress_seconds",
+                "temp_limit_c", "hotspot_limit_c", "power_limit_w",
+                "bin_min_mv", "bin_max_mv",
+            )
+            if k in _prof
+        }
+        eprint(f"Applying GPU profile '{_pre_profile}' ({_prof['name']}) as defaults.")
+
     p = argparse.ArgumentParser(
         description="VoltVandal v1.1 (single-file) - VF curve tweak + stress + monitor harness."
     )
@@ -1638,8 +2452,16 @@ def parse_args() -> argparse.Namespace:
         "--stress-timeout",
         dest="stress_timeout",
         type=int,
-        default=180,
-        help="Hard wall-clock timeout (seconds) for each stress run. Kills hung stress tools. Default: 180",
+        default=None,
+        metavar="SEC",
+        help=(
+            "Hard wall-clock timeout (seconds) per stress-tool run. "
+            "Kills the stress process if it exceeds this limit. "
+            "If omitted, VoltVandal auto-computes 5× the per-mode test "
+            "duration (e.g. --multi-stress-seconds 60 -> 300s), which is "
+            "enough to absorb long warm-up phases without risking infinite "
+            "hangs. Pass an explicit value only if you need a tighter cap."
+        ),
     )
     sp.add_argument(
         "--poll-seconds",
@@ -1670,16 +2492,82 @@ def parse_args() -> argparse.Namespace:
         help="Abort if any throttle reason is nonzero",
     )
     sp.add_argument(
+        "--power-limit-pct",
+        dest="power_limit_pct",
+        type=int,
+        default=100,
+        metavar="PCT",
+        help=(
+            "Set GPU power limit as a percentage of the factory default TDP "
+            "before the run starts, and restore it on exit. "
+            "Accepted range: 1–115 (hardware enforces its own max; values above "
+            "115%% are clamped). Default 100 (no change). "
+            "Example: --power-limit-pct 110 to allow 10%% above default TDP."
+        ),
+    )
+    sp.add_argument(
+        "--no-live-display",
+        dest="no_live_display",
+        action="store_true",
+        help=(
+            "Disable the live GPU metrics line printed to stderr during each "
+            "stress run (GPU temp, hotspot, VRAM junction, core/mem clocks, "
+            "load%%, voltage, power). Useful when piping output to a file."
+        ),
+    )
+    sp.add_argument(
+        "--no-plot",
+        dest="no_plot",
+        action="store_true",
+        help=(
+            "Skip generating the VF curve PNG after the run completes. "
+            "By default VoltVandal saves artifacts/vf_curve_plot.png comparing "
+            "the stock curve against the last-good tuned curve (requires matplotlib)."
+        ),
+    )
+    sp.add_argument(
         "--target-voltage-mv",
         dest="target_voltage_mv",
         type=int,
         default=0,
+        metavar="mV",
         help=(
-            "[vlock mode] Voltage (mV) to use as the curve anchor. "
+            "[vlock mode] Voltage (mV) to lock the curve anchor at. "
             "The nearest stock-curve bin is selected automatically. "
             "Required when --mode vlock. Example: --target-voltage-mv 987"
         ),
     )
+    sp.add_argument(
+        "--start-freq-mhz",
+        dest="start_freq_mhz",
+        type=int,
+        default=0,
+        metavar="MHz",
+        help=(
+            "[vlock mode] Skip the step-0 baseline test and begin the OC "
+            "search directly at this frequency. Useful when stock stability "
+            "at the anchor voltage is already confirmed and you want to start "
+            "near your expected ceiling rather than stepping up from scratch. "
+            "The value is rounded to the nearest --step-mhz boundary above "
+            "the stock anchor frequency. "
+            "Example: --start-freq-mhz 1980"
+        ),
+    )
+    sp.add_argument(
+        "--gpu-profile",
+        dest="gpu_profile",
+        default=None,
+        metavar="PROFILE",
+        help=(
+            "Apply a GPU-series profile as default values "
+            "(e.g. rtx20, rtx30, rtx40, rtx50). "
+            "Any explicit flag overrides the profile. "
+            "Run with --list-profiles to see all available profiles."
+        ),
+    )
+    # Apply GPU profile values as subparser defaults (overridden by explicit flags).
+    if _profile_defaults:
+        sp.set_defaults(**_profile_defaults)
     sp.set_defaults(func=cmd_run)
 
     sp = sub.add_parser(
@@ -1728,6 +2616,15 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     _install_signal_handlers()
+
+    # --list-profiles: works without a subcommand; handle before full parse.
+    if "--list-profiles" in sys.argv:
+        if _gpu_profiles is not None:
+            _gpu_profiles.list_profiles()
+        else:
+            eprint("gpu_profiles.py not found. Place it alongside voltvandal.py.")
+        return 0
+
     args = parse_args()
     warn_if_not_admin()
 

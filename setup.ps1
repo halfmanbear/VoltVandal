@@ -127,7 +127,7 @@ try {
 }
 
 # ─── 3. Core pip packages ────────────────────────────────────────────────────
-Write-Step "Installing pip packages (nvidia-ml-py, psutil, numpy, PyOpenGL)"
+Write-Step "Installing pip packages (nvidia-ml-py, psutil, matplotlib, numpy, PyOpenGL)"
 
 # Remove deprecated pynvml wrapper if present (nvidia-ml-py replaces it)
 $oldPynvml = & $pythonExe -m pip show pynvml 2>&1
@@ -136,7 +136,7 @@ if ($LASTEXITCODE -eq 0) {
     & $pythonExe -m pip uninstall pynvml -y --quiet 2>&1 | Out-Null
 }
 
-$pipPkgs = @("nvidia-ml-py", "psutil", "numpy", "PyOpenGL", "PyOpenGL_accelerate")
+$pipPkgs = @("nvidia-ml-py", "psutil", "matplotlib", "numpy", "PyOpenGL", "PyOpenGL_accelerate")
 foreach ($pkg in $pipPkgs) {
     Write-Info "  pip install $pkg ..."
     & $pythonExe -m pip install --quiet --upgrade $pkg
@@ -183,6 +183,45 @@ if (-not $SkipCupy) {
         Write-Info "  Or re-run:  .\setup.ps1 -CudaVersion cuda12x"
     } else {
         Write-OK "cupy ($cupyPkg)"
+    }
+
+    # ── 4b. CUDA runtime DLLs (cublas, cudart) via pip ───────────────────────
+    # cupy-cudaXXX ships only the Python bindings; the actual CUDA compute
+    # libraries (cublas64_12.dll, cudart64_12.dll …) must come from either the
+    # CUDA Toolkit or these nvidia-* pip packages.  cuda-pathfinder (already a
+    # cupy dependency) will call os.add_dll_directory() to register them so
+    # Python 3.8+ finds them without any PATH change required.
+    #
+    # Only the cuda12x packages exist on PyPI today; for older CUDA the user
+    # needs the full Toolkit — we warn but don't abort.
+    if ($CudaVersion -eq "cuda12x") {
+        Write-Info "  Installing CUDA 12 runtime libraries (cublas, cudart) via pip..."
+        $cudaRtPkgs = @("nvidia-cublas-cu12", "nvidia-cuda-runtime-cu12")
+        foreach ($pkg in $cudaRtPkgs) {
+            Write-Info "    pip install $pkg ..."
+            & $pythonExe -m pip install --quiet --upgrade $pkg
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warn "    pip install $pkg returned non-zero — check output above."
+            } else {
+                Write-OK "    $pkg"
+            }
+        }
+    } else {
+        Write-Warn "  CUDA runtime pip packages only available for cuda12x."
+        Write-Info "  For CUDA 11.x / 10.x ensure the CUDA Toolkit is installed and on PATH."
+    }
+
+    # ── 4c. Functional cupy verification (exercises cublas DLL load) ─────────
+    Write-Info "  Verifying cupy can perform GPU matrix ops (tests cublas DLL load)..."
+    $cupyVerify = & $pythonExe -c "import cupy as cp, sys; a=cp.ones((64,64),dtype=cp.float32); cp.dot(a,a); print('cupy dot OK')" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-OK "cupy GPU matrix ops verified — cublas loads correctly."
+    } else {
+        Write-Warn "cupy matrix test failed: $cupyVerify"
+        Write-Warn "doloMing 'matrix' mode will not function until this is resolved."
+        Write-Info "  Most likely fix: install CUDA Toolkit 12.x from:"
+        Write-Info "    https://developer.nvidia.com/cuda-downloads"
+        Write-Info "  (Windows → x86_64 → exe local; adds CUDA bin to PATH automatically)"
     }
 } else {
     Write-Warn "Skipping cupy (--SkipCupy). doloMing GPU modes will not work without it."
