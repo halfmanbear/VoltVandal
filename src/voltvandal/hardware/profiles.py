@@ -85,7 +85,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
         "temp_limit_c": 83,
         "hotspot_limit_c": 93,
         "power_limit_w": 380,
-        "bin_min_mv": 800,
+        "bin_min_mv": 450,
         "bin_max_mv": 1000,
         "notes": (
             "Ampere GA102 chips (3080/3090 family) are power-hungry; "
@@ -198,7 +198,7 @@ def list_profiles() -> None:
     print(
         "\nUsage:\n"
         "  python voltvandal.py run --mode vlock --gpu-profile rtx40 \\\n"
-        "    --gpu 0 --out artifacts --doloming .\\doloMing\\stress.py \\\n"
+        "    --gpu 0 --out artifacts \\\n"
         "    --doloming-modes ray,matrix,frequency-max\n"
         "\n  Profile values are defaults — any explicit flag overrides them.\n"
     )

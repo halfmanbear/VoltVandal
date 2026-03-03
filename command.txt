@@ -1,0 +1,1 @@
+python voltvandal.py run --mode vlock --gpu-profile rtx30 --target-voltage-mv 900 --out artifacts

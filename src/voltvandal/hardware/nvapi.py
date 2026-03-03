@@ -1,15 +1,15 @@
 """
 nvapi_curve.py — pure-Python NVAPI VF-curve interface for VoltVandal
 ---------------------------------------------------------------------
-Replaces the nvapi-cmd.exe subprocess with direct in-process calls to
+Uses direct in-process calls to
 nvapi64.dll via ctypes.  Only the two operations VoltVandal needs are
 implemented:
 
     dump_curve(gpu_index, out_csv)   — read GPU VF curve → write CSV
     apply_curve(gpu_index, in_csv)   — read CSV → apply to GPU
 
-Design is a faithful Python translation of the relevant C++ in
-https://github.com/buswedg/nvapi-cmd (MIT / public domain).
+Design is a faithful Python translation of the relevant C++ reference
+implementation from buswedg (MIT / public domain).
 
 Struct layouts and QueryInterface IDs cross-referenced against:
   - https://github.com/Demion/nvapioc
@@ -33,6 +33,7 @@ import csv
 import ctypes
 import os
 import sys
+import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -62,7 +63,7 @@ _ID_GetPerfDecreaseInfo      = 0x7F7F4600  # NvAPI_GPU_GetPerfDecreaseInfo — t
 _ID_GetCurrentPstate         = 0x927DA4F6  # NvAPI_GPU_GetCurrentPstate — P0/P8/etc.
 _ID_ClientPowerTopoGetStatus = 0xEDCF624E  # NvAPI_GPU_ClientPowerTopologyGetStatus
 
-# ── struct definitions (mirrors nvapi-cmd.cpp exactly) ────────────────────────
+# ── struct definitions (mirrors the reference C++ layout) ─────────────────────
 
 class _MaskEntry(ctypes.Structure):
     """One entry in NV_GPU_CLOCK_MASKS.clocks[255]."""
@@ -80,6 +81,7 @@ class _NV_GPU_CLOCK_MASKS(ctypes.Structure):
       u8    unknown1[32]
       _MaskEntry clocks[255]   // 255 × 24 = 6120
     """
+    _pack_ = 8
     _fields_ = [
         ("version",  ctypes.c_uint32),
         ("mask",     ctypes.c_uint8 * 32),
@@ -105,6 +107,7 @@ class _NV_GPU_VFP_CURVE(ctypes.Structure):
       u8    unknown1[32]
       _VFPEntry clocks[255]    // 255 × 28 = 7140
     """
+    _pack_ = 8
     _fields_ = [
         ("version",  ctypes.c_uint32),
         ("mask",     ctypes.c_uint8 * 32),
@@ -130,6 +133,7 @@ class _NV_GPU_CLOCK_TABLE(ctypes.Structure):
       u8    unknown1[32]
       _TableEntry clocks[255]  // 255 × 36 = 9180
     """
+    _pack_ = 8
     _fields_ = [
         ("version",  ctypes.c_uint32),
         ("mask",     ctypes.c_uint8 * 32),
@@ -320,7 +324,7 @@ def _qif(func_id: int, restype, argtypes):
             "function not supported by this driver version."
         )
 
-    # All nvapi-cmd functions use __cdecl (CFUNCTYPE, not WINFUNCTYPE).
+    # NVAPI QueryInterface exports use __cdecl (CFUNCTYPE, not WINFUNCTYPE).
     ftype = ctypes.CFUNCTYPE(restype, *argtypes)
     func = ftype(ptr)
     _func_cache[func_id] = func
@@ -370,6 +374,8 @@ def _get_handle(gpu_index: int) -> int:
 
 
 def _get_clock_masks(handle: int) -> _NV_GPU_CLOCK_MASKS:
+    # Increased sleep to 0.05s as 0.01s wasn't enough for very long tuning runs
+    time.sleep(0.05)
     masks = _NV_GPU_CLOCK_MASKS()
     masks.version = ctypes.sizeof(masks) | (1 << 16)
     f = _qif(
@@ -733,7 +739,7 @@ def dump_curve(gpu_index: int, out_csv: "str | Path") -> None:
     """
     Read the current VF curve from *gpu_index* and write it to *out_csv*.
 
-    CSV format (same as nvapi-cmd.exe output):
+    CSV format:
         voltageUV,frequencyKHz
         850000,1830000
         ...
@@ -816,7 +822,7 @@ def apply_curve(gpu_index: int, in_csv: "str | Path") -> None:
     _set_clock_table(handle, table)
 
 
-# ── CLI shim — mirrors nvapi-cmd.exe -curve interface ────────────────────────
+# ── CLI shim — compact -curve interface ───────────────────────────────────────
 #
 #   python nvapi_curve.py -curve <gpu> -1 <out.csv>   (dump)
 #   python nvapi_curve.py -curve <gpu>  1 <in.csv>    (apply)
