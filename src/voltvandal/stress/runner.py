@@ -234,7 +234,7 @@ def run_doloming(
     if interrupted_by_user:
         raise KeyboardInterrupt("User pressed Ctrl+C")
     if exit_code is not None:
-        return (exit_code, exit_reason or "")
+        return (exit_code, out_text)
     return (p.returncode or 0, out_text)
 
 def run_gpuburn(
