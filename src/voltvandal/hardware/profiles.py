@@ -24,7 +24,7 @@ Fields (all values are conservative starting points):
   step_mv             UV step size per trial (mV)
   max_steps           Max trials per phase
   stress_seconds      Duration per stress run (seconds; used in single-mode)
-  multi_stress_seconds Per-mode duration when --doloming-modes is used
+  multi_stress_seconds Per-mode duration when --doloming-mode is a comma-separated list
   temp_limit_c        Edge (GPU die) temperature abort threshold (°C)
   hotspot_limit_c     Hotspot (junction) temperature abort threshold (°C)
   power_limit_w       Power abort threshold (W) — set near card TDP
@@ -52,10 +52,10 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
         "step_mhz": 10,
         "step_mv": 5,
         "max_steps": 30,
-        "stress_seconds": 120,
-        "multi_stress_seconds": 45,
-        "temp_limit_c": 83,
-        "hotspot_limit_c": 92,
+        "stress_seconds": 60,
+        "multi_stress_seconds": 40,
+        "temp_limit_c": 90,
+        "hotspot_limit_c": 95,
         "power_limit_w": 260,
         "bin_min_mv": 800,
         "bin_max_mv": 975,
@@ -76,14 +76,14 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     # TDP range: 170–450 W (3090 Ti 450 W)
     "rtx30": {
         "name": "RTX 30xx (Ampere)",
-        "target_voltage_mv": 912,
+        "target_voltage_mv": 890,
         "step_mhz": 15,
         "step_mv": 5,
         "max_steps": 30,
-        "stress_seconds": 120,
-        "multi_stress_seconds": 45,
-        "temp_limit_c": 83,
-        "hotspot_limit_c": 93,
+        "stress_seconds": 60,
+        "multi_stress_seconds": 40,
+        "temp_limit_c": 90,
+        "hotspot_limit_c": 95,
         "power_limit_w": 380,
         "bin_min_mv": 450,
         "bin_max_mv": 1000,
@@ -108,9 +108,9 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
         "step_mhz": 15,
         "step_mv": 5,
         "max_steps": 30,
-        "stress_seconds": 120,
-        "multi_stress_seconds": 45,
-        "temp_limit_c": 83,
+        "stress_seconds": 60,
+        "multi_stress_seconds": 40,
+        "temp_limit_c": 90,
         "hotspot_limit_c": 95,
         "power_limit_w": 400,
         "bin_min_mv": 850,
@@ -136,9 +136,9 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
         "step_mhz": 15,
         "step_mv": 5,
         "max_steps": 30,
-        "stress_seconds": 120,
-        "multi_stress_seconds": 45,
-        "temp_limit_c": 83,
+        "stress_seconds": 60,
+        "multi_stress_seconds": 40,
+        "temp_limit_c": 90,
         "hotspot_limit_c": 95,
         "power_limit_w": 450,
         "bin_min_mv": 862,
@@ -199,7 +199,7 @@ def list_profiles() -> None:
         "\nUsage:\n"
         "  python voltvandal.py run --mode vlock --gpu-profile rtx40 \\\n"
         "    --gpu 0 --out artifacts \\\n"
-        "    --doloming-modes ray,matrix,frequency-max\n"
+        "    --doloming-mode ray,matrix,frequency-max\n"
         "\n  Profile values are defaults — any explicit flag overrides them.\n"
     )
     print(bar)

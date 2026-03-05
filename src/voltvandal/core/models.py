@@ -15,6 +15,7 @@ class CandidateResult:
     telemetry_max_power_w: Optional[float] = None
     telemetry_any_throttle: Optional[bool] = None
     stress_exit_codes: Optional[Dict] = None
+    metrics: Optional[Dict] = None
 
 @dataclass
 class SessionState:
@@ -25,7 +26,7 @@ class SessionState:
     last_good_curve_csv: str
     checkpoint_json: str
 
-    mode: str  # "uv" | "oc" | "hybrid"
+    mode: str  # "uv" | "oc" | "hybrid" | "vlock" | "mvscan"
     bin_min_mv: int
     bin_max_mv: int
 
@@ -73,14 +74,16 @@ class SessionState:
                                        # 0 = use full oc_gain on next bin entry
     vlock_phase: str = "oc"            # "oc" | "uv" | "done"
     vlock_oc_base_freq_khz: int = 0    # freq floor found by floor-search (0 = use stock)
-    vlock_start_freq_mhz: int = 0     # user-supplied OC start freq; baseline skipped when > 0
-    vlock_last_fail_step: int = -1    # last known failing OC step in Phase 1 (for resume skip/refine)
+    vlock_start_freq_mhz: int = 0     # Phase 1 OC search start frequency (MHz), 0 = base/stock
+    vlock_last_fail_step: int = -1    # Phase 1 coarse->fine boundary (failing coarse step, -1 = coarse mode)
+    mvscan_objective: str = "balanced"  # balanced | max-clock | min-cap
 
     # power limit
-    power_limit_pct: int = 100        # % of GPU default TDP to apply before run (100 = no change)
-    gpu_target_temp_c: int = 0        # real GPU throttle target temp via nvidia-smi -gtt (0 = unchanged)
-    fan_mode: str = "auto"            # requested fan mode: auto|manual (manual support backend-dependent)
-    fan_speed_pct: int = 0            # requested manual fan speed percent (0 = unchanged)
+    power_limit_pct: int = 100        # % of GPU default TDP to apply before run (100 = unchanged)
+    gpu_throttle_temp_c: int = 0      # real GPU throttle target temp via nvidia-smi -gtt (0 = unchanged)
+    gpu_throttle_temp_restore_c: int = 0  # captured pre-run target temp to restore on emergency reset
+    fan_mode: str = "auto"            # requested fan mode: auto|manual
+    fan_speed_pct: int = 0            # requested manual fan speed percent
 
     # display
     live_display: bool = True         # print live GPU metrics line during stress

@@ -10,15 +10,27 @@ from __future__ import annotations
 
 import argparse
 import math
+import statistics
 import time
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional
 
-import numpy as np
 import pynvml
 
 try:
-    import cupy as cp  # type: ignore
+    warnings.filterwarnings(
+        "ignore",
+        message=r"A NumPy version .* is required for this version of SciPy.*",
+        category=UserWarning,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"A NumPy version .* is required for this version of SciPy.*",
+            category=UserWarning,
+        )
+        import cupy as cp  # type: ignore
 except Exception as exc:  # pragma: no cover
     raise SystemExit(
         "ERROR: cupy is required for integrated stress tests. "
@@ -32,6 +44,8 @@ class Metrics:
     util_max: float = 0.0
     freq_avg: float = 0.0
     freq_max: float = 0.0
+    util_std: float = 0.0
+    util_in_band_pct: float = 0.0
     temp_max: float = 0.0
     power_max: float = 0.0
     samples: int = 0
@@ -113,6 +127,9 @@ def _run_mode(
 ) -> Metrics:
     handle = _nvml_handle(gpu_index)
     m = Metrics()
+    util_samples: list[float] = []
+    pacing_sleep_s = 0.0
+    matrix_loops = 2
 
     with cp.cuda.Device(gpu_index):
         cp.random.seed(1337)
@@ -134,7 +151,7 @@ def _run_mode(
         next_log = 0.0
         while time.time() < end_t:
             if mode == "matrix":
-                _work_matrix(a, b, out, loops=2)
+                _work_matrix(a, b, out, loops=matrix_loops)
             elif mode == "ray":
                 _work_ray(origins, dirs, spheres_center, spheres_radius, loops=1)
             elif mode == "frequency-max":
@@ -147,14 +164,25 @@ def _run_mode(
             cp.cuda.runtime.deviceSynchronize()
             sample = _read_metrics(handle)
             _accumulate(m, sample)
+            util_samples.append(sample["util"])
 
-            # For util-targeted modes, lightly modulate pacing to stay near target.
+            # For util-targeted modes, modulate pacing gradually instead of
+            # bang-bang sleeps; this avoids severe 0%/100% oscillation.
             if mode in ("ray", "matrix", "simple"):
                 err = sample["util"] - target_percent
-                if err > 10:
-                    time.sleep(0.02)
-                elif err < -10:
-                    time.sleep(0.002)
+                if mode == "matrix":
+                    if err < -14 and matrix_loops < 6:
+                        matrix_loops += 1
+                    elif err > 14 and matrix_loops > 1:
+                        matrix_loops -= 1
+                if err > 4:
+                    pacing_sleep_s = min(0.012, pacing_sleep_s + 0.0015)
+                elif err < -4:
+                    pacing_sleep_s = max(0.0, pacing_sleep_s - 0.0010)
+                else:
+                    pacing_sleep_s = max(0.0, pacing_sleep_s - 0.0004)
+                if pacing_sleep_s > 0.0:
+                    time.sleep(pacing_sleep_s)
 
             if time.time() >= next_log:
                 remaining = int(max(0.0, end_t - time.time()))
@@ -167,6 +195,11 @@ def _run_mode(
             score_gamma = max(0.0, min(120.0, score_gamma))
             print(f"Score_gamma : {score_gamma:.2f}")
             print(f"Avg/Max ratio : {m.freq_avg / float(max_freq_mhz):.4f}")
+
+    if util_samples:
+        m.util_std = statistics.pstdev(util_samples) if len(util_samples) > 1 else 0.0
+        in_band = sum(1 for v in util_samples if abs(v - target_percent) <= 10.0)
+        m.util_in_band_pct = 100.0 * in_band / len(util_samples)
 
     return _finalize(m)
 
@@ -207,8 +240,15 @@ def main() -> int:
         return 1
 
     assert result is not None
-    util_std = 0.0  # lightweight runner does not keep full history
-    status = "Successfully maintain" if result.util_avg >= 35.0 else "Unstable"
+    if args.mode == "frequency-max":
+        status = "Successfully maintain" if result.util_avg >= 35.0 else "Unstable"
+    else:
+        min_avg = max(25.0, args.target_percent * 0.55)
+        status = (
+            "Successfully maintain"
+            if result.util_avg >= min_avg and result.util_in_band_pct >= 20.0
+            else "Unstable"
+        )
     print(
         f"Status              : {status}\n"
         f"Average Utilization : {result.util_avg:.2f}%\n"
@@ -217,7 +257,8 @@ def main() -> int:
         f"Max Frequency       : {result.freq_max:.2f} MHz\n"
         f"Max Temperature     : {result.temp_max:.2f} C\n"
         f"Max Power           : {result.power_max:.2f} W\n"
-        f"Util Stddev         : {util_std:.2f}"
+        f"Util Stddev         : {result.util_std:.2f}\n"
+        f"Util In-Band        : {result.util_in_band_pct:.2f}%"
     )
     return 0
 

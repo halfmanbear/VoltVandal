@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 try:
     import pynvml
@@ -26,6 +26,7 @@ _TDR_BASE_CLOCK_MHZ: int = 600
 _TDR_ARM_MIN_UTIL_PCT: int = 35
 _TDR_MIN_SECONDS_BEFORE_DETECT: float = 8.0
 _TDR_COLLAPSE_POLLS: int = 3
+_THROTTLE_ABORT_CONSECUTIVE_POLLS: int = 3
 
 _THROTTLE_LABELS = {
     0x0000000000000001: "Idle",
@@ -40,6 +41,19 @@ _THROTTLE_LABELS = {
 }
 
 _THROTTLE_IDLE_BIT = 0x0000000000000001
+_THROTTLE_PWRCAP_BIT = 0x0000000000000004
+_THROTTLE_SEVERE_BITS = (
+    0x0000000000000008  # HwSlowdn
+    | 0x0000000000000020  # SwTherm
+    | 0x0000000000000040  # HwTherm
+    | 0x0000000000000080  # PwrBrake
+)
+_PERF_DECREASE_LABELS = {
+    0x00000001: "InsufficientPower",
+    0x00000004: "AcPower",
+    0x00000010: "PowerBrake",
+    0x00000040: "Thermal",
+}
 
 def _decode_throttle(reasons: int) -> str:
     if reasons == 0:
@@ -48,7 +62,28 @@ def _decode_throttle(reasons: int) -> str:
     return "+".join(active) if active else f"0x{reasons:X}"
 
 def _has_actionable_throttle(reasons: int) -> bool:
-    return (reasons & ~_THROTTLE_IDLE_BIT) != 0
+    actionable = reasons & ~_THROTTLE_IDLE_BIT
+    if actionable == 0:
+        return False
+    # Ignore pure power-cap throttling for abort logic; this is common and
+    # not by itself a stability failure.
+    if actionable == _THROTTLE_PWRCAP_BIT:
+        return False
+    return True
+
+def _decode_perf_decrease(info: Optional[int]) -> str:
+    if info is None:
+        return ""
+    if info == 0:
+        return "None"
+    active = [lbl for bit, lbl in _PERF_DECREASE_LABELS.items() if info & bit]
+    return "+".join(active) if active else f"0x{info:X}"
+
+def _next_throttle_streak(prev_streak: int, reasons: int) -> int:
+    return prev_streak + 1 if _has_actionable_throttle(reasons) else 0
+
+def _fmt_signed_int(value: int) -> str:
+    return f"+{value}" if value >= 0 else str(value)
 
 class NvmlMonitor:
     def __init__(
@@ -62,8 +97,12 @@ class NvmlMonitor:
         abort_on_throttle: bool,
         log_csv: Path,
         curve_csv: Optional[Path] = None,
+        stock_curve_csv: Optional[Path] = None,
+        mode: str = "",
+        vlock_target_mv: int = 0,
         expected_test_seconds: Optional[int] = None,
         live_display: bool = True,
+        use_nvapi_live: bool = False,
     ):
         self.gpu_index = gpu_index
         self.poll_seconds = poll_seconds
@@ -74,8 +113,12 @@ class NvmlMonitor:
         self.abort_on_throttle = abort_on_throttle
         self.log_csv = log_csv
         self.curve_csv = curve_csv
+        self.stock_curve_csv = stock_curve_csv
+        self.mode = mode
+        self.vlock_target_mv = vlock_target_mv
         self.expected_test_seconds = expected_test_seconds
         self.live_display = live_display
+        self.use_nvapi_live = use_nvapi_live
         self._live_line_len: int = 0
 
         self.stop_event = threading.Event()
@@ -87,31 +130,73 @@ class NvmlMonitor:
         self.max_power: Optional[float] = None
         self.any_throttle: bool = False
         self.last_snapshot: Optional[MonitorSnapshot] = None
+        self.abort_reason: str = ""
         self._consecutive_errors: int = 0
         self._curve_points: Optional[List[CurvePoint]] = None
+        self._stock_curve_points: Optional[List[CurvePoint]] = None
         self._sticky_warn_until: float = 0.0
         self._sticky_warn_text: str = ""
 
         self.driver_reset_detected: bool = False
         self._had_boost_clock: bool = False
         self._tdr_collapse_polls: int = 0
+        self._actionable_throttle_streak: int = 0
         self._started_monotonic: float = time.monotonic()
+        self._sample_count: int = 0
+        self._clock_samples: List[int] = []
+        self._clock_sum_mhz: float = 0.0
+        self._throttle_any_count: int = 0
+        self._throttle_pwr_count: int = 0
+        self._throttle_severe_count: int = 0
+        self._throttle_label_counts: Dict[str, int] = {}
 
     def _estimate_voltage_mv_from_curve(self, clock_mhz: int) -> Optional[int]:
-        if clock_mhz <= 0:
+        return self._estimate_voltage_mv_from_points(clock_mhz, stock=False)
+
+    def _estimate_stock_voltage_mv(self, clock_mhz: int) -> Optional[int]:
+        return self._estimate_voltage_mv_from_points(clock_mhz, stock=True)
+
+    def _estimate_stock_freq_mhz(self, voltage_mv: int) -> Optional[int]:
+        if voltage_mv <= 0:
             return None
-        if self._curve_points is None:
-            if self.curve_csv is None or not self.curve_csv.exists():
+        points = self._stock_curve_points
+        if points is None:
+            if self.stock_curve_csv is None or not self.stock_curve_csv.exists():
                 return None
             try:
-                self._curve_points = load_curve_csv(self.curve_csv)
+                points = load_curve_csv(self.stock_curve_csv)
             except Exception:
-                self._curve_points = []
-        if not self._curve_points:
+                points = []
+            self._stock_curve_points = points
+
+        if not points:
+            return None
+
+        target_uv = voltage_mv * 1000
+        best = min(points, key=lambda p: abs(p.voltage_uv - target_uv))
+        return int(round(best.freq_khz / 1000.0))
+
+    def _estimate_voltage_mv_from_points(self, clock_mhz: int, stock: bool) -> Optional[int]:
+        if clock_mhz <= 0:
+            return None
+
+        points_cache_name = "_stock_curve_points" if stock else "_curve_points"
+        points = getattr(self, points_cache_name)
+        csv_path = self.stock_curve_csv if stock else self.curve_csv
+        if points is None:
+            if csv_path is None or not csv_path.exists():
+                return None
+            try:
+                points = load_curve_csv(csv_path)
+            except Exception:
+                points = []
+            setattr(self, points_cache_name, points)
+
+        if not points:
             return None
 
         target_khz = clock_mhz * 1000
-        best = min(self._curve_points, key=lambda p: abs(p.freq_khz - target_khz))
+        best = min(points, key=lambda p: abs(p.freq_khz - target_khz))
         if abs(best.freq_khz - target_khz) > 250_000:
             return None
         return int(round(best.voltage_uv / 1000.0))
@@ -161,7 +246,7 @@ class NvmlMonitor:
                 topo_gpu_mw: Optional[int] = None
                 topo_total_mw: Optional[int] = None
 
-                if _nvapi_native is not None:
+                if self.use_nvapi_live and _nvapi_native is not None:
                     try:
                         thr = _nvapi_native.get_thermal_sensors(self.gpu_index)
                         if thr["hotspot_c"] is not None:
@@ -205,34 +290,50 @@ class NvmlMonitor:
                     voltage_mv, voltage_estimated, pstate, perf_decrease, topo_gpu_mw, topo_total_mw,
                 )
                 self.last_snapshot = snap
+                self._sample_count += 1
+                self._clock_samples.append(clock)
+                self._clock_sum_mhz += float(clock)
+                throttle_no_idle = throttle & ~_THROTTLE_IDLE_BIT
+                if throttle_no_idle:
+                    self._throttle_any_count += 1
+                if throttle & _THROTTLE_PWRCAP_BIT:
+                    self._throttle_pwr_count += 1
+                if throttle & _THROTTLE_SEVERE_BITS:
+                    self._throttle_severe_count += 1
+                for bit, lbl in _THROTTLE_LABELS.items():
+                    if bit == _THROTTLE_IDLE_BIT:
+                        continue
+                    if throttle & bit:
+                        self._throttle_label_counts[lbl] = self._throttle_label_counts.get(lbl, 0) + 1
 
                 self.max_temp = temp if self.max_temp is None else max(self.max_temp, temp)
                 self.max_hotspot = hotspot if self.max_hotspot is None else max(self.max_hotspot, hotspot)
                 self.max_power = power if self.max_power is None else max(self.max_power, power)
-                if _has_actionable_throttle(throttle):
+                self._actionable_throttle_streak = _next_throttle_streak(
+                    self._actionable_throttle_streak, throttle
+                )
+                if self._actionable_throttle_streak > 0:
                     self.any_throttle = True
 
                 vram_str = f"{vram_junc:.1f}" if vram_junc is not None else ""
                 volt_str = str(voltage_mv) if voltage_mv is not None else ""
                 pstate_str = str(pstate) if pstate is not None else ""
-                pdec_str = f"0x{perf_decrease:X}" if perf_decrease is not None else ""
+                throttle_lbl = _decode_throttle(throttle)
+                throttle_str = str(throttle) if not throttle_lbl else f"{throttle} ({throttle_lbl})"
+                pdec_lbl = _decode_perf_decrease(perf_decrease)
+                pdec_raw = f"0x{perf_decrease:X}" if perf_decrease is not None else ""
+                pdec_str = pdec_raw if not pdec_lbl else f"{pdec_raw} ({pdec_lbl})"
                 gpu_mw_str = str(topo_gpu_mw) if topo_gpu_mw is not None else ""
                 tot_mw_str = str(topo_total_mw) if topo_total_mw is not None else ""
                 with self.log_csv.open("a", newline="") as f:
                     w = csv.writer(f)
                     w.writerow(
                         [now_utc_iso(), temp, f"{hotspot:.1f}", vram_str,
-                         f"{power:.1f}", clock, mem_clock, util, volt_str, throttle,
+                         f"{power:.1f}", clock, mem_clock, util, volt_str, throttle_str,
                          pstate_str, pdec_str, gpu_mw_str, tot_mw_str]
                     )
 
                 if self.live_display:
-                    display_power_w = power
-                    if topo_total_mw is not None:
-                        topo_total_w = topo_total_mw / 1000.0
-                        if topo_total_w > 20.0 and (power <= 0.0 or (0.5 * power <= topo_total_w <= 2.0 * power)):
-                            display_power_w = topo_total_w
-
                     core_parts = [f"Edge {temp}C", f"Hot {hotspot:.0f}C"]
                     _elapsed = int(max(0.0, time.monotonic() - self._started_monotonic))
                     if self.expected_test_seconds:
@@ -244,16 +345,28 @@ class NvmlMonitor:
                     if pstate is not None: optional_parts.append(f"P{pstate}")
                     core_parts += [f"Gfx {clock}MHz", f"U {util}%"]
                     optional_parts.append(f"Mem {mem_clock}MHz")
-                    if voltage_mv is not None:
+                    if self.mode == "vlock" and self.vlock_target_mv > 0:
+                        target_mv = int(self.vlock_target_mv)
+                        core_parts.append(f"V {target_mv}mV")
+                        stock_mv = self._estimate_stock_voltage_mv(clock)
+                        if stock_mv is not None:
+                            vdelta_mv = target_mv - stock_mv
+                            optional_parts.append(f"Vdelta {_fmt_signed_int(vdelta_mv)}mV")
+                        stock_freq_mhz = self._estimate_stock_freq_mhz(target_mv)
+                        if stock_freq_mhz is not None:
+                            fdelta_mhz = clock - stock_freq_mhz
+                            optional_parts.append(f"Fdelta {_fmt_signed_int(fdelta_mhz)}MHz")
+                    elif voltage_mv is not None:
                         core_parts.append(f"V~ {voltage_mv}mV" if voltage_estimated else f"V {voltage_mv}mV")
                     else:
                         core_parts.append("V n/a")
-                    core_parts.append(f"Pwr {display_power_w:.0f}W")
-                    throttle_lbl = _decode_throttle(throttle)
+                    core_parts.append(f"PwrNVML {power:.0f}W")
                     if throttle_lbl and throttle_lbl != "Idle":
                         optional_parts.append(f"Thr:{throttle_lbl}")
                         self._sticky_warn_text = f"WARN:{throttle_lbl}"
                         self._sticky_warn_until = time.monotonic() + 6.0
+                    if pdec_lbl and pdec_lbl != "None":
+                        optional_parts.append(f"Perf:{pdec_lbl}")
                     if self.driver_reset_detected: optional_parts.append("DRIVER_RESET")
                     if time.monotonic() < self._sticky_warn_until and self._sticky_warn_text:
                         optional_parts.append(self._sticky_warn_text)
@@ -270,7 +383,24 @@ class NvmlMonitor:
                     sys.stderr.write(f"\r{line:<{self._live_line_len}}")
                     sys.stderr.flush()
 
-                if temp >= self.temp_limit_c or (self.hotspot_limit_c and hotspot >= self.hotspot_limit_c) or power >= self.power_limit_w or (self.abort_on_throttle and _has_actionable_throttle(throttle)):
+                if temp >= self.temp_limit_c:
+                    if not self.abort_event.is_set():
+                        self.abort_reason = f"EDGE_TEMP_{temp}C_GE_{self.temp_limit_c}C"
+                    self.abort_event.set()
+                elif self.hotspot_limit_c and hotspot >= self.hotspot_limit_c:
+                    if not self.abort_event.is_set():
+                        self.abort_reason = f"HOTSPOT_{hotspot:.1f}C_GE_{self.hotspot_limit_c}C"
+                    self.abort_event.set()
+                elif power >= self.power_limit_w:
+                    if not self.abort_event.is_set():
+                        self.abort_reason = f"POWER_{power:.1f}W_GE_{self.power_limit_w:.1f}W"
+                    self.abort_event.set()
+                elif self.abort_on_throttle and self._actionable_throttle_streak >= _THROTTLE_ABORT_CONSECUTIVE_POLLS:
+                    if not self.abort_event.is_set():
+                        self.abort_reason = (
+                            f"THROTTLE_{throttle_lbl or throttle}"
+                            f"_STREAK_{self._actionable_throttle_streak}"
+                        )
                     self.abort_event.set()
 
                 if clock >= _TDR_MIN_BOOST_MHZ and util >= _TDR_ARM_MIN_UTIL_PCT:
@@ -292,6 +422,46 @@ class NvmlMonitor:
                 continue
             self._consecutive_errors = 0
             self.stop_event.wait(timeout=self.poll_seconds)
+
+    def _clock_p95_mhz(self) -> Optional[float]:
+        if not self._clock_samples:
+            return None
+        values = sorted(self._clock_samples)
+        if len(values) == 1:
+            return float(values[0])
+        idx = int(round(0.95 * (len(values) - 1)))
+        idx = max(0, min(idx, len(values) - 1))
+        return float(values[idx])
+
+    def metrics(self) -> Dict[str, float]:
+        samples = float(self._sample_count)
+        if samples <= 0.0:
+            return {
+                "sample_count": 0.0,
+                "avg_clock_mhz": 0.0,
+                "p95_clock_mhz": 0.0,
+                "max_clock_mhz": 0.0,
+                "throttle_any_ratio_pct": 0.0,
+                "throttle_pwr_ratio_pct": 0.0,
+                "throttle_severe_ratio_pct": 0.0,
+                "throttle_any_count": 0.0,
+                "throttle_pwr_count": 0.0,
+                "throttle_severe_count": 0.0,
+            }
+        p95 = self._clock_p95_mhz() or 0.0
+        max_clock = float(max(self._clock_samples)) if self._clock_samples else 0.0
+        return {
+            "sample_count": samples,
+            "avg_clock_mhz": self._clock_sum_mhz / samples,
+            "p95_clock_mhz": p95,
+            "max_clock_mhz": max_clock,
+            "throttle_any_ratio_pct": (self._throttle_any_count / samples) * 100.0,
+            "throttle_pwr_ratio_pct": (self._throttle_pwr_count / samples) * 100.0,
+            "throttle_severe_ratio_pct": (self._throttle_severe_count / samples) * 100.0,
+            "throttle_any_count": float(self._throttle_any_count),
+            "throttle_pwr_count": float(self._throttle_pwr_count),
+            "throttle_severe_count": float(self._throttle_severe_count),
+        }
 
     def stop(self) -> None:
         self.stop_event.set()

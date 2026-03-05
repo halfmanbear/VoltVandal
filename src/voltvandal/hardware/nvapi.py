@@ -33,6 +33,7 @@ import csv
 import ctypes
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -51,10 +52,10 @@ _ID_GetClockBoostTable      = 0x23F1B133
 _ID_SetClockBoostTable      = 0x0733E009
 _ID_GetThermalSensors        = 0x65FE3AAD
 # Voltage reading — tried in order by get_current_voltage_mv():
-#   1. GetCoreVoltage           0x58337FA3  — simple NvU32* getter (mV or µV)
+#   1. ClientVoltRailsGetStatus 0x465F9BCF  — per-rail struct (Pack=1)
 #   2. GetVoltageDomainsStatus  0xC16C7E2C  — struct-based domain table
 #                                             (0x7296F6D4 was wrong, returned NULL)
-#   3. ClientVoltRailsGetStatus 0x465F9BCF  — per-rail struct (Pack=1)
+#   3. GetCoreVoltage           0x58337FA3  — simple NvU32* getter (mV or µV)
 _ID_GetCoreVoltage           = 0x58337FA3
 _ID_GetVoltDomainsStatus     = 0xC16C7E2C
 _ID_ClientVoltRailsGetStatus = 0x465F9BCF
@@ -557,14 +558,14 @@ def get_current_voltage_mv(gpu_index: int) -> Optional[int]:
     """
     Read the current GPU core voltage in millivolts.
 
-    Tries up to three undocumented NvAPI methods in order of reliability:
+    Tries up to three undocumented NvAPI methods in order:
 
-      1. NvAPI_GPU_GetCoreVoltage (0x58337FA3) — simple NvU32 pointer; returns
-         mV or µV directly.  Most likely to work on modern drivers (RTX series).
+      1. NvAPI_GPU_ClientVoltRailsGetStatus (0x465F9BCF) — per-rail struct
+         (Pack=1); rail_id 0 = GPU core voltage rail; volt_uv in microvolts.
       2. NvAPI_GPU_GetVoltageDomainsStatus (0xC16C7E2C) — versioned struct that
          returns per-domain voltages; domain 0 = GPU core.
-      3. NvAPI_GPU_ClientVoltRailsGetStatus (0x465F9BCF) — per-rail struct
-         (Pack=1); rail_id 0 = GPU core voltage rail; volt_uv in microvolts.
+      3. NvAPI_GPU_GetCoreVoltage (0x58337FA3) — simple NvU32 pointer; returns
+         mV or µV directly.
 
     Returns the core voltage in mV (e.g. 875), or None if no method succeeds
     or no valid reading is available.
@@ -579,19 +580,24 @@ def get_current_voltage_mv(gpu_index: int) -> Optional[int]:
     _nvapi_init()
     handle = _get_handle(gpu_index)
 
-    # ── Attempt 1: NvAPI_GPU_GetCoreVoltage (0x58337FA3) ─────────────────────
+    # ── Attempt 1: NvAPI_GPU_ClientVoltRailsGetStatus (0x465F9BCF) ───────────
     try:
         f1 = _qif(
-            _ID_GetCoreVoltage,
+            _ID_ClientVoltRailsGetStatus,
             ctypes.c_int,
-            [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
+            [ctypes.c_void_p, ctypes.POINTER(_NV_GPU_CLIENT_VOLT_RAILS_STATUS)],
         )
-        raw = ctypes.c_uint32(0)
-        rc = f1(ctypes.c_void_p(handle), ctypes.byref(raw))
+        rails_status = _NV_GPU_CLIENT_VOLT_RAILS_STATUS()
+        rails_status.version = ctypes.sizeof(rails_status) | (1 << 16)
+        rc = f1(ctypes.c_void_p(handle), ctypes.byref(rails_status))
         if rc == 0:
-            mv = _mv_from_raw(raw.value)
-            if mv is not None:
-                return mv
+            n = min(rails_status.num_rails, _NVAPI_MAX_VOLT_RAILS)
+            for i in range(n):
+                rail = rails_status.rails[i]
+                if rail.rail_id == 0 and rail.volt_uv > 0:
+                    mv = _mv_from_raw(rail.volt_uv)
+                    if mv is not None:
+                        return mv
     except Exception:
         pass  # function not available on this driver; try next
 
@@ -616,24 +622,19 @@ def get_current_voltage_mv(gpu_index: int) -> Optional[int]:
     except Exception:
         pass
 
-    # ── Attempt 3: NvAPI_GPU_ClientVoltRailsGetStatus (0x465F9BCF) ───────────
+    # ── Attempt 3: NvAPI_GPU_GetCoreVoltage (0x58337FA3) ─────────────────────
     try:
         f3 = _qif(
-            _ID_ClientVoltRailsGetStatus,
+            _ID_GetCoreVoltage,
             ctypes.c_int,
-            [ctypes.c_void_p, ctypes.POINTER(_NV_GPU_CLIENT_VOLT_RAILS_STATUS)],
+            [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)],
         )
-        rails_status = _NV_GPU_CLIENT_VOLT_RAILS_STATUS()
-        rails_status.version = ctypes.sizeof(rails_status) | (1 << 16)
-        rc = f3(ctypes.c_void_p(handle), ctypes.byref(rails_status))
+        raw = ctypes.c_uint32(0)
+        rc = f3(ctypes.c_void_p(handle), ctypes.byref(raw))
         if rc == 0:
-            n = min(rails_status.num_rails, _NVAPI_MAX_VOLT_RAILS)
-            for i in range(n):
-                rail = rails_status.rails[i]
-                if rail.rail_id == 0 and rail.volt_uv > 0:
-                    mv = _mv_from_raw(rail.volt_uv)
-                    if mv is not None:
-                        return mv
+            mv = _mv_from_raw(raw.value)
+            if mv is not None:
+                return mv
     except Exception:
         pass
 
@@ -735,6 +736,34 @@ def get_power_topology_mw(gpu_index: int) -> Optional[dict]:
         return None
 
 
+def _call_with_timeout(func, timeout_seconds: float, *args, **kwargs):
+    """
+    Run an NVAPI operation on a daemon worker thread and bound wait time.
+    This prevents a driver-side deadlock from freezing the CLI indefinitely.
+    """
+    done = threading.Event()
+    result: dict = {}
+    error: dict = {}
+
+    def _worker() -> None:
+        try:
+            result["value"] = func(*args, **kwargs)
+        except Exception as ex:
+            error["value"] = ex
+        finally:
+            done.set()
+
+    t = threading.Thread(target=_worker, name=f"nvapi_{func.__name__}", daemon=True)
+    t.start()
+    if not done.wait(timeout=max(1.0, float(timeout_seconds))):
+        raise TimeoutError(
+            f"NVAPI call {func.__name__} timed out after {float(timeout_seconds):.1f}s"
+        )
+    if "value" in error:
+        raise error["value"]
+    return result.get("value")
+
+
 def dump_curve(gpu_index: int, out_csv: "str | Path") -> None:
     """
     Read the current VF curve from *gpu_index* and write it to *out_csv*.
@@ -820,6 +849,24 @@ def apply_curve(gpu_index: int, in_csv: "str | Path") -> None:
             )
 
     _set_clock_table(handle, table)
+
+
+def reset_curve(gpu_index: int) -> None:
+    """Reset VF curve deltas to driver defaults for the selected GPU."""
+    _nvapi_init()
+    _reset_curve(_get_handle(gpu_index))
+
+
+def apply_curve_safe(
+    gpu_index: int,
+    in_csv: "str | Path",
+    timeout_seconds: float = 10.0,
+) -> None:
+    _call_with_timeout(apply_curve, timeout_seconds, gpu_index, in_csv)
+
+
+def reset_curve_safe(gpu_index: int, timeout_seconds: float = 10.0) -> None:
+    _call_with_timeout(reset_curve, timeout_seconds, gpu_index)
 
 
 # ── CLI shim — compact -curve interface ───────────────────────────────────────

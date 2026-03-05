@@ -23,6 +23,9 @@ def load_session(out_dir: Path) -> SessionState:
     if not checkpoint.exists():
         raise FileNotFoundError(f"No session checkpoint found: {checkpoint}")
     data = json.loads(checkpoint.read_text(encoding="utf-8"))
+    # Backward compatibility: field renamed in March 2026.
+    if "gpu_throttle_temp_c" not in data and "gpu_target_temp_c" in data:
+        data["gpu_throttle_temp_c"] = data["gpu_target_temp_c"]
     
     # Get all field names from the dataclass
     all_fields = {f.name for f in fields(SessionState)}

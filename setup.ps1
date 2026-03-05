@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    VoltVandal dependency setup (integrated stress + native NVAPI backend).
+    VoltVandal dependency setup (official doloMing stress + native NVAPI backend).
 
 .DESCRIPTION
     Installs Python packages required by VoltVandal:
@@ -11,7 +11,8 @@
 
     The project now uses:
       - `nvapi_curve.py` as the only VF-curve backend
-      - `vv_stress.py` as the in-repo stress runner (based on doloMing)
+      - `gpu-cpu-stress-tests/nvidia_gpu_stress_test.py` from:
+        https://github.com/doloMing/gpu-cpu-stress-tests
 #>
 
 [CmdletBinding()]
@@ -32,7 +33,7 @@ function Write-Info([string]$msg) { Write-Host "          $msg" -ForegroundColor
 
 Write-Host ""
 Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Magenta
-Write-Host "║      VoltVandal  —  Dependency Setup (Refactor) ║" -ForegroundColor Magenta
+Write-Host "║      VoltVandal  —  Dependency Setup (Official) ║" -ForegroundColor Magenta
 Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Magenta
 Write-Host "  Install dir : $InstallDir"
 
@@ -119,11 +120,34 @@ if (-not $SkipCupy) {
         }
     }
 } else {
-    Write-Warn "Skipping cupy (--SkipCupy). Integrated GPU stress modes will be unavailable."
+    Write-Warn "Skipping cupy (--SkipCupy). GPU stress modes will be unavailable."
+}
+
+Write-Step "Ensuring official gpu-cpu-stress-tests repository"
+$stressRepoUrl = "https://github.com/doloMing/gpu-cpu-stress-tests.git"
+$stressRepoDir = Join-Path $InstallDir "gpu-cpu-stress-tests"
+$gitExe = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitExe) {
+    Write-Warn "git not found on PATH; cannot clone/update $stressRepoUrl"
+} else {
+    if (Test-Path (Join-Path $stressRepoDir ".git")) {
+        Write-Info "  Updating existing repository at $stressRepoDir ..."
+        & $gitExe.Source -C $stressRepoDir pull --ff-only
+        if ($LASTEXITCODE -eq 0) { Write-OK "Updated gpu-cpu-stress-tests" }
+        else { Write-Warn "git pull failed for $stressRepoDir" }
+    } elseif (Test-Path $stressRepoDir) {
+        Write-Warn "Directory exists but is not a git repo: $stressRepoDir"
+        Write-Warn "Remove it manually, then re-run setup to clone official source."
+    } else {
+        Write-Info "  Cloning $stressRepoUrl ..."
+        & $gitExe.Source clone $stressRepoUrl $stressRepoDir
+        if ($LASTEXITCODE -eq 0) { Write-OK "Cloned gpu-cpu-stress-tests" }
+        else { Write-Warn "git clone failed for $stressRepoUrl" }
+    }
 }
 
 Write-Step "Verifying local runtime files"
-foreach ($f in @("voltvandal.py", "nvapi_curve.py", "vv_stress.py")) {
+foreach ($f in @("voltvandal.py", "nvapi_curve.py", "gpu-cpu-stress-tests\nvidia_gpu_stress_test.py")) {
     $p = Join-Path $InstallDir $f
     if (Test-Path $p) { Write-OK "$f found" }
     else { Write-Warn "$f missing at $p" }
