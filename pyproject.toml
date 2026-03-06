@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voltvandal"
+version = "1.2.0"
+description = "A safety-first Windows CLI harness for NVIDIA GPU undervolting and overclocking."
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [
+    { name = "VoltVandal Contributors" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+]
+dependencies = [
+    "nvidia-ml-py",
+    "numpy",
+    "cupy-cuda12x; platform_system == 'Windows'",
+    "matplotlib",
+]
+
+[project.scripts]
+voltvandal = "voltvandal.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
