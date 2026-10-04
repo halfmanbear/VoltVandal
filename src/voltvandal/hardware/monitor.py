@@ -14,6 +14,7 @@ except ImportError:
 from ..core.models import MonitorSnapshot, CurvePoint
 from ..core.utils import eprint, now_utc_iso
 from ..core.curve import load_curve_csv
+from .point_lock import read_voltage_mv
 
 # Import native nvapi if available
 try:
@@ -103,6 +104,10 @@ class NvmlMonitor:
         expected_test_seconds: Optional[int] = None,
         live_display: bool = True,
         use_nvapi_live: bool = False,
+        point_lock_bus: Optional[int] = None,
+        point_voltage_mv: float = 0.0,
+        point_clock_mhz: float = 0.0,
+        point_voltage_tolerance_mv: float = 3.0,
     ):
         self.gpu_index = gpu_index
         self.poll_seconds = poll_seconds
@@ -119,6 +124,12 @@ class NvmlMonitor:
         self.expected_test_seconds = expected_test_seconds
         self.live_display = live_display
         self.use_nvapi_live = use_nvapi_live
+        self.point_lock_bus = point_lock_bus
+        self.point_voltage_mv = point_voltage_mv
+        self.point_clock_mhz = point_clock_mhz
+        self.point_voltage_tolerance_mv = point_voltage_tolerance_mv
+        self._point_counts = (0, 0, 0)  # loaded samples, valid voltage, on-target
+        self._point_read_errors = 0
         self._live_line_len: int = 0
 
         self.stop_event = threading.Event()
@@ -273,6 +284,18 @@ class NvmlMonitor:
                             topo_total_mw = topo.get("total_mw")
                     except Exception:
                         pass
+
+                if self.point_lock_bus is not None:
+                    try:
+                        voltage_mv = read_voltage_mv(self.gpu_index, self.point_lock_bus)
+                        self._point_read_errors = 0
+                    except Exception:
+                        voltage_mv = None
+                        self._point_read_errors += 1
+                        if self._point_read_errors >= 3:
+                            self.abort_reason = "POINT_VOLTAGE_UNAVAILABLE"
+                            self.abort_event.set()
+                    self._record_point_sample(voltage_mv, clock, util)
 
                 if voltage_mv is not None:
                     if voltage_mv > 20000:
@@ -432,6 +455,28 @@ class NvmlMonitor:
         idx = int(round(0.95 * (len(values) - 1)))
         idx = max(0, min(idx, len(values) - 1))
         return float(values[idx])
+
+    def _record_point_sample(self, voltage_mv, clock_mhz, utilization):
+        if utilization <= 0:
+            return
+        loaded, measured, matched = self._point_counts
+        valid = voltage_mv is not None
+        on_target = (valid
+                     and abs(voltage_mv - self.point_voltage_mv) <= self.point_voltage_tolerance_mv
+                     and abs(clock_mhz - self.point_clock_mhz) <= 15.0)
+        self._point_counts = (loaded + 1, measured + int(valid), matched + int(on_target))
+
+    def point_marker(self):
+        return self._point_counts
+
+    def point_coverage(self, marker=(0, 0, 0)):
+        loaded, measured, matched = (v - old for v, old in zip(self._point_counts, marker))
+        return {"loaded_samples": loaded, "measured_samples": measured,
+                "matched_samples": matched,
+                "coverage_pct": 100.0 * matched / loaded if loaded else 0.0,
+                "target_voltage_mv": self.point_voltage_mv,
+                "target_clock_mhz": self.point_clock_mhz,
+                "voltage_tolerance_mv": self.point_voltage_tolerance_mv}
 
     def metrics(self) -> Dict[str, float]:
         samples = float(self._sample_count)

@@ -5,6 +5,9 @@ import json
 import threading
 
 from voltvandal.core.models import SessionState, CandidateResult, CurvePoint
+from contextlib import contextmanager
+from voltvandal.core import tuning
+from voltvandal.hardware.point_lock import PointLockError
 from voltvandal.core.tuning import (
     run_session,
     evaluate_candidate,
@@ -45,6 +48,106 @@ def mock_state(tmp_path):
         power_limit_w=400,
         abort_on_throttle=True,
     )
+
+
+@pytest.fixture
+def point_test(monkeypatch, mock_state):
+    mock_state.mode = "vlock"
+    mock_state.point_lock = True
+    calls = []
+
+    @contextmanager
+    def temporary(gpu, voltage, journal):
+        calls.append(("lock", voltage))
+        try:
+            yield 3
+        finally:
+            calls.append(("restore", voltage))
+
+    monitor = MagicMock()
+    monitor.abort_event = threading.Event()
+    monitor.abort_reason = ""
+    monitor.metrics.return_value = {}
+    monitor.point_coverage.return_value = dict(
+        loaded_samples=5, measured_samples=5, matched_samples=5, coverage_pct=100.0)
+    monitor.point_marker.return_value = (0, 0, 0)
+    monkeypatch.setattr(tuning, "NvmlMonitor", MagicMock(return_value=monitor))
+    monkeypatch.setattr(tuning, "inspect_point_lock", MagicMock(return_value={"bus": 3}))
+    monkeypatch.setattr(tuning, "check_monitor_identity", MagicMock(return_value="GPU-test"))
+    monkeypatch.setattr(tuning, "temporary_point_lock", temporary)
+    monkeypatch.setattr(tuning, "nvapi_apply_curve_safe", MagicMock())
+    monkeypatch.setattr(tuning, "run_doloming", MagicMock(return_value=(0, "Success")))
+    event = MagicMock()
+    event.is_set.return_value = False
+    return monitor, calls, event
+
+
+def test_point_candidate_passes_only_with_coverage(mock_state, point_test):
+    monitor, calls, event = point_test
+    result = evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                                threading.Event(), target_point=CurvePoint(900000, 1800000))
+    assert result.ok
+    assert calls == [("lock", 900000), ("restore", 900000)]
+    monitor.stop.assert_called_once()
+    assert tuning.NvmlMonitor.call_args.kwargs["point_clock_mhz"] == 1800.0
+    report = Path(mock_state.out_dir) / "logs" / "point_point.jsonl"
+    assert json.loads(report.read_text())["coverage_pct"] == 100.0
+
+
+def test_insufficient_coverage_is_inconclusive_and_restores(mock_state, point_test):
+    monitor, calls, event = point_test
+    monitor.point_coverage.return_value = dict(
+        loaded_samples=10, measured_samples=10, matched_samples=1, coverage_pct=10.0)
+    with pytest.raises(PointLockError, match="INCONCLUSIVE_POINT_COVERAGE"):
+        evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                           threading.Event(), target_point=CurvePoint(900000, 1800000))
+    assert calls[-1][0] == "restore"
+    assert mock_state.current_step == 0
+    monitor.stop.assert_called_once()
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("spawn failed"), KeyboardInterrupt()])
+def test_point_workload_exceptions_cleanup(mock_state, point_test, failure):
+    monitor, calls, event = point_test
+    tuning.run_doloming.side_effect = failure
+    with pytest.raises(type(failure)):
+        evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                           threading.Event(), target_point=CurvePoint(900000, 1800000))
+    assert calls[-1][0] == "restore"
+    monitor.stop.assert_called_once()
+
+
+def test_point_timeout_does_not_count_as_instability(mock_state, point_test):
+    monitor, calls, event = point_test
+    tuning.run_doloming.return_value = (998, "STRESS_TIMEOUT")
+    with pytest.raises(PointLockError, match="INCONCLUSIVE_POINT_TEST"):
+        evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                           threading.Event(), target_point=CurvePoint(900000, 1800000))
+    assert calls[-1][0] == "restore"
+
+
+def test_point_capability_failure_does_not_apply_curve(mock_state, point_test):
+    _, calls, event = point_test
+    tuning.inspect_point_lock.side_effect = PointLockError("unsupported")
+    with pytest.raises(PointLockError, match="unsupported"):
+        evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                           threading.Event(), target_point=CurvePoint(900000, 1800000))
+    tuning.nvapi_apply_curve_safe.assert_not_called()
+    assert calls == []
+
+
+def test_second_workload_must_also_cover_the_point(mock_state, point_test):
+    monitor, calls, event = point_test
+    mock_state.doloming_modes = "simple,matrix"
+    monitor.point_coverage.side_effect = [
+        dict(matched_samples=5, coverage_pct=100.0),
+        dict(matched_samples=0, coverage_pct=0.0),
+    ]
+    with pytest.raises(PointLockError, match="matrix"):
+        evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
+                           threading.Event(), target_point=CurvePoint(900000, 1800000))
+    assert tuning.run_doloming.call_count == 2
+    assert calls[-1][0] == "restore"
 
 @patch("voltvandal.core.tuning.nvapi_apply_curve_safe")
 @patch("voltvandal.core.tuning.run_doloming")

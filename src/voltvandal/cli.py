@@ -50,6 +50,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--step-mhz", type=int, default=argparse.SUPPRESS, help="Frequency step size (profile default if omitted)")
     p_run.add_argument("--max-steps", type=int, default=argparse.SUPPRESS, help="Maximum number of steps (profile default if omitted)")
     p_run.add_argument("--vlock-start-freq-mhz", type=int, default=0, help="Phase 1 start frequency for vlock search (0 = start at base/stock)")
+    p_run.add_argument("--point-lock", action="store_true", help="Experimental vlock point tests: lock/read back each voltage bin and require observed voltage/clock coverage")
     p_run.add_argument("--mvscan-objective", choices=["balanced", "max-clock", "min-cap"], default="balanced", help="Objective used by mvscan to rank stable voltage caps")
     
     # Stress params
@@ -85,6 +86,11 @@ def create_parser() -> argparse.ArgumentParser:
     p_res = sub.add_parser("resume", help="Resume a tuning session from checkpoint")
     p_res.add_argument("--out", type=str, default="artifacts", help="Output directory")
 
+    p_info = sub.add_parser("point-lock-info", help="Read-only point-lock API capability check (no tuning)")
+    p_info.add_argument("--gpu", type=int, default=0, help="GPU index")
+    p_recover = sub.add_parser("recover-point-lock", help="Restore the lock saved before an interrupted point test")
+    p_recover.add_argument("--out", default="artifacts", help="Session output directory containing point_lock_recovery.json")
+
     # Profiles command
     p_prof = sub.add_parser("profiles", help="List available GPU profiles")
 
@@ -107,6 +113,8 @@ def create_parser() -> argparse.ArgumentParser:
 def parse_args():
     parser = create_parser()
     args = parser.parse_args()
+    if args.command == "run" and args.point_lock and args.mode != "vlock":
+        parser.error("--point-lock requires --mode vlock")
     
     if args.command == "profiles":
         list_profiles()
