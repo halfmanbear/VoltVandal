@@ -1,5 +1,8 @@
 from voltvandal.hardware.monitor import _has_actionable_throttle, _next_throttle_streak
+<<<<<<< HEAD
 from voltvandal.hardware.monitor import NvmlMonitor
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 
 
 def test_has_actionable_throttle_ignores_pure_pwrcap():
@@ -29,6 +32,7 @@ def test_next_throttle_streak_debounces_transients():
     # Non-actionable resets streak.
     streak = _next_throttle_streak(streak, 0x0000000000000001)  # Idle
     assert streak == 0
+<<<<<<< HEAD
 
 
 def point_monitor(tmp_path):
@@ -60,3 +64,5 @@ def test_each_workload_has_independent_point_coverage(tmp_path):
     coverage = monitor.point_coverage(marker)
     assert coverage["loaded_samples"] == 1
     assert coverage["coverage_pct"] == 0.0
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef

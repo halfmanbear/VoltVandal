@@ -5,9 +5,12 @@ import json
 import threading
 
 from voltvandal.core.models import SessionState, CandidateResult, CurvePoint
+<<<<<<< HEAD
 from contextlib import contextmanager
 from voltvandal.core import tuning
 from voltvandal.hardware.point_lock import PointLockError
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from voltvandal.core.tuning import (
     run_session,
     evaluate_candidate,
@@ -49,6 +52,7 @@ def mock_state(tmp_path):
         abort_on_throttle=True,
     )
 
+<<<<<<< HEAD
 
 @pytest.fixture
 def point_test(monkeypatch, mock_state):
@@ -149,6 +153,8 @@ def test_second_workload_must_also_cover_the_point(mock_state, point_test):
     assert tuning.run_doloming.call_count == 2
     assert calls[-1][0] == "restore"
 
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 @patch("voltvandal.core.tuning.nvapi_apply_curve_safe")
 @patch("voltvandal.core.tuning.run_doloming")
 @patch("voltvandal.core.tuning.NvmlMonitor")

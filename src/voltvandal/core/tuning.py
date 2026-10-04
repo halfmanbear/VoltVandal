@@ -5,7 +5,10 @@ import shutil
 import sys
 import threading
 import time
+<<<<<<< HEAD
 from contextlib import nullcontext
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -20,9 +23,12 @@ from .curve import (
 from .session import save_session, session_paths
 from ..hardware.nvapi import apply_curve_safe as nvapi_apply_curve_safe
 from ..hardware.monitor import NvmlMonitor
+<<<<<<< HEAD
 from ..hardware.point_lock import (
     PointLockError, temporary_point_lock, inspect_point_lock, check_monitor_identity,
 )
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from ..stress.runner import run_doloming, run_gpuburn
 
 _WARMUP_MIN_SECONDS = 30
@@ -64,6 +70,7 @@ def evaluate_candidate(
     interrupted_event: threading.Event,
     manual_recovery_event: threading.Event,
     max_freq_mhz: int = 0,
+<<<<<<< HEAD
     target_point: Optional[CurvePoint] = None,
 ) -> CandidateResult:
     targeted = bool(state.point_lock and target_point is not None)
@@ -112,6 +119,8 @@ def _evaluate_applied_candidate(
     target_point: Optional[CurvePoint],
     point_lock_bus: Optional[int],
     monitors: list,
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 ) -> CandidateResult:
     out_dir = Path(state.out_dir)
     logs_dir = out_dir / "logs"
@@ -133,6 +142,17 @@ def _evaluate_applied_candidate(
             metrics=monitor_obj.metrics() if monitor_obj else None,
         )
 
+<<<<<<< HEAD
+=======
+    try:
+        nvapi_apply_curve_safe(state.gpu, candidate_csv, timeout_seconds=12.0)
+        interrupted_event.wait(timeout=2.0)
+        if interrupted_event.is_set():
+            raise KeyboardInterrupt("User pressed Ctrl+C")
+    except Exception as ex:
+        return _build_result(False, f"APPLY_FAILED: {ex}", None, None)
+
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     monitor_log = logs_dir / "telemetry.csv"
     monitor: Optional[NvmlMonitor] = None
     abort_event = threading.Event()
@@ -146,6 +166,7 @@ def _evaluate_applied_candidate(
     if state.doloming: _expected_test_seconds += _secs_each * len(_run_modes)
     if state.gpuburn: _expected_test_seconds += state.stress_seconds
 
+<<<<<<< HEAD
     point_options = {}
     if target_point is not None:
         distances = [abs(p.voltage_uv - target_point.voltage_uv) / 1000.0
@@ -157,6 +178,8 @@ def _evaluate_applied_candidate(
             point_clock_mhz=target_point.freq_khz / 1000.0,
             point_voltage_tolerance_mv=min(10.0, min(distances) * 0.49) if distances else 3.0,
         )
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     try:
         monitor = NvmlMonitor(
             gpu_index=state.gpu,
@@ -174,13 +197,18 @@ def _evaluate_applied_candidate(
             expected_test_seconds=_expected_test_seconds if _expected_test_seconds > 0 else None,
             live_display=state.live_display,
             use_nvapi_live=False,
+<<<<<<< HEAD
             **point_options,
         )
         monitors.append(monitor)
+=======
+        )
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
         monitor.start()
         abort_event = monitor.abort_event
     except Exception as e:
         eprint(f"Failed to start monitor: {e}")
+<<<<<<< HEAD
         if target_point is not None:
             raise PointLockError(f"Point test monitor unavailable: {e}") from e
         return _build_result(False, f"MONITOR_START_FAILED: {e}", None, None)
@@ -201,6 +229,14 @@ def _evaluate_applied_candidate(
         _dolo_timeout = state.stress_timeout if state.stress_timeout is not None else max(_secs_each * 5, 300)
         for _mode in _run_modes:
             marker = monitor.point_marker() if target_point else None
+=======
+        return _build_result(False, f"MONITOR_START_FAILED: {e}", None, None)
+
+    stress_exit_codes = {}
+    if state.doloming:
+        _dolo_timeout = state.stress_timeout if state.stress_timeout is not None else max(_secs_each * 5, 300)
+        for _mode in _run_modes:
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             dololog = logs_dir / f"{candidate_label}_doloming_{_mode}.log"
             rc, out_text = run_doloming(
                 state.doloming, state.gpu, _mode, _secs_each, None, dololog,
@@ -209,18 +245,30 @@ def _evaluate_applied_candidate(
             )
             _key = f"doloming_{_mode}" if _use_multi else "doloming"
             stress_exit_codes[_key] = rc
+<<<<<<< HEAD
             if target_point and (rc in (996, 998) or monitor.abort_reason == "POINT_VOLTAGE_UNAVAILABLE"):
                 raise PointLockError(f"INCONCLUSIVE_POINT_TEST: {_mode}, rc={rc}, {monitor.abort_reason}")
             if rc != 0:
+=======
+            if rc != 0:
+                if monitor: monitor.stop()
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
                 _reason = "MANUAL_RECOVERY_REQUESTED" if rc == 997 else f"DOLOMING_{_mode.upper().replace('-', '_')}_RC_{rc}"
                 return _build_result(False, _reason, monitor, stress_exit_codes)
             _stable, _instability_reason = _parse_doloming_stability(out_text, _mode)
             if not _stable:
+<<<<<<< HEAD
                 return _build_result(False, _instability_reason, monitor, stress_exit_codes)
             check_point_coverage(marker, _mode)
 
     if state.gpuburn:
         marker = monitor.point_marker() if target_point else None
+=======
+                if monitor: monitor.stop()
+                return _build_result(False, _instability_reason, monitor, stress_exit_codes)
+
+    if state.gpuburn:
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
         burnlog = logs_dir / f"{candidate_label}_gpuburn.log"
         _burn_timeout = state.stress_timeout if state.stress_timeout is not None else state.stress_seconds * 5
         rc, out_text, parsed_ok = run_gpuburn(
@@ -229,6 +277,7 @@ def _evaluate_applied_candidate(
             stress_timeout=_burn_timeout,
         )
         stress_exit_codes["gpuburn"] = rc
+<<<<<<< HEAD
         if target_point and (rc in (996, 998) or monitor.abort_reason == "POINT_VOLTAGE_UNAVAILABLE"):
             raise PointLockError(f"INCONCLUSIVE_POINT_TEST: gpuburn, rc={rc}, {monitor.abort_reason}")
         if rc != 0 or not parsed_ok or re.search(r"\bnan\b|\bfailed\b|errors?\s*[:=]\s*[1-9][0-9]*", out_text, re.I):
@@ -241,6 +290,16 @@ def _evaluate_applied_candidate(
 
     if monitor:
         if monitor.abort_event.is_set():
+=======
+        if rc != 0 or not parsed_ok or re.search(r"\bnan\b|\bfailed\b|errors?\s*[:=]\s*[1-9]", out_text, re.I):
+            if monitor: monitor.stop()
+            _reason = f"GPUBURN_RC_{rc}" if rc != 0 else ("GPUBURN_ERRORS_DETECTED" if not parsed_ok else "GPUBURN_OUTPUT_ERROR_KEYWORD")
+            return _build_result(False, _reason, monitor, stress_exit_codes)
+
+    if monitor:
+        if monitor.abort_event.is_set():
+            monitor.stop()
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             if monitor.driver_reset_detected:
                 reason = "GPU_DRIVER_RESET_DETECTED"
             elif monitor.abort_reason:
@@ -248,6 +307,10 @@ def _evaluate_applied_candidate(
             else:
                 reason = "MONITOR_ABORT_THRESHOLD"
             return _build_result(False, reason, monitor, stress_exit_codes)
+<<<<<<< HEAD
+=======
+        monitor.stop()
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 
     return _build_result(True, "PASS", monitor, stress_exit_codes)
 
@@ -261,7 +324,10 @@ def evaluate_candidate_confident(
     passes_required: int = 1,
     max_runs: int = 1,
     warmup: bool = False,
+<<<<<<< HEAD
     target_point: Optional[CurvePoint] = None,
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 ) -> CandidateResult:
     all_results: List[CandidateResult] = []
     hard_fail_prefixes = ("APPLY_FAILED", "GPU_DRIVER_RESET_DETECTED", "MONITOR_ABORT_THRESHOLD", "DOLOMING_", "GPUBURN_")
@@ -271,7 +337,10 @@ def evaluate_candidate_confident(
 
     orig_stress = state.stress_seconds
     orig_multi = state.multi_stress_seconds
+<<<<<<< HEAD
     point_options = {"target_point": target_point} if target_point is not None else {}
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     try:
         if warmup:
             state.stress_seconds = max(
@@ -282,7 +351,11 @@ def evaluate_candidate_confident(
                 _WARMUP_MIN_SECONDS,
                 min(_WARMUP_MAX_SECONDS, max(1, orig_multi // 2)),
             )
+<<<<<<< HEAD
             w = evaluate_candidate(state, candidate_csv, f"{candidate_label}_warmup", interrupted_event, manual_recovery_event, max_freq_mhz, **point_options)
+=======
+            w = evaluate_candidate(state, candidate_csv, f"{candidate_label}_warmup", interrupted_event, manual_recovery_event, max_freq_mhz)
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             all_results.append(w)
             if not w.ok and _is_hard_fail(w.reason): return _merge_results(all_results, False, f"WARMUP_HARD_FAIL:{w.reason}")
 
@@ -291,7 +364,11 @@ def evaluate_candidate_confident(
         fails = 0
         fail_reasons = []
         for i in range(1, max_runs + 1):
+<<<<<<< HEAD
             r = evaluate_candidate(state, candidate_csv, f"{candidate_label}_run{i}", interrupted_event, manual_recovery_event, max_freq_mhz, **point_options)
+=======
+            r = evaluate_candidate(state, candidate_csv, f"{candidate_label}_run{i}", interrupted_event, manual_recovery_event, max_freq_mhz)
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             all_results.append(r)
             if r.ok:
                 passes += 1
@@ -583,9 +660,15 @@ def run_mvscan_session(
     print("\n=== mvscan complete ===")
     print(
         f"Best candidate: {best_mv} mV | "
+<<<<<<< HEAD
         f"P95 {float(best['p95_clock_mhz']):.0f} MHz | "
         f"SevereCap {float(best['throttle_severe_ratio_pct']):.1f}% | "
         f"PwrCap {float(best['throttle_pwr_ratio_pct']):.1f}%"
+=======
+        f"P95 {best['p95_clock_mhz']:.0f} MHz | "
+        f"SevereCap {best['throttle_severe_ratio_pct']:.1f}% | "
+        f"PwrCap {best['throttle_pwr_ratio_pct']:.1f}%"
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     )
     print(f"Results saved: {results_csv}")
 
@@ -697,8 +780,12 @@ def run_vlock_session(state: SessionState, interrupted_event: threading.Event, m
             _p1_mode = "coarse" if state.vlock_last_fail_step < 0 else "fine"
             label = f"vlock_p1_step{step:03d}_{cand_freq//1000}mhz_{_p1_mode}"
             print(f"\n== {label} ==")
+<<<<<<< HEAD
             point_options = {"target_point": CurvePoint(anchor_v_uv, cand_freq)} if state.point_lock else {}
             result = evaluate_candidate_confident(state, cand_csv, label, interrupted_event, manual_recovery_event, max_freq_mhz=cand_freq//1000, **point_options)
+=======
+            result = evaluate_candidate_confident(state, cand_csv, label, interrupted_event, manual_recovery_event, max_freq_mhz=cand_freq//1000)
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             if result.ok:
                 print("Result: PASS")
             else:
@@ -784,8 +871,12 @@ def run_vlock_session(state: SessionState, interrupted_event: threading.Event, m
             
             label = f"vlock_p2_bin{bin_idx:03d}_{stock_points[bin_idx].voltage_uv//1000}mv"
             print(f"\n== {label} ==")
+<<<<<<< HEAD
             point_options = {"target_point": test_pts[bin_idx]} if state.point_lock else {}
             result = evaluate_candidate_confident(state, cand_csv, label, interrupted_event, manual_recovery_event, **point_options)
+=======
+            result = evaluate_candidate_confident(state, cand_csv, label, interrupted_event, manual_recovery_event)
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
             if result.ok:
                 print("Result: PASS")
             else:

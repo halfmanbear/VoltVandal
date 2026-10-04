@@ -77,7 +77,10 @@ class SessionState:
     vlock_start_freq_mhz: int = 0     # Phase 1 OC search start frequency (MHz), 0 = base/stock
     vlock_last_fail_step: int = -1    # Phase 1 coarse->fine boundary (failing coarse step, -1 = coarse mode)
     mvscan_objective: str = "balanced"  # balanced | max-clock | min-cap
+<<<<<<< HEAD
     point_lock: bool = False           # opt-in verified point tests for vlock
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 
     # power limit
     power_limit_pct: int = 100        # % of GPU default TDP to apply before run (100 = unchanged)

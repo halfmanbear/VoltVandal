@@ -1,5 +1,8 @@
 import shutil
+<<<<<<< HEAD
 import json
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 import signal
 import threading
 from pathlib import Path
@@ -15,10 +18,13 @@ from .hardware.nvapi import (
     reset_curve_safe as nvapi_reset_curve_safe,
 )
 from .hardware.profiles import get_profile
+<<<<<<< HEAD
 from .hardware.point_lock import (
     PointLockError, inspect_point_lock, restore_point_lock, read_voltage_mv,
     check_monitor_identity,
 )
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from .hardware.runtime_controls import (
     apply_fan_control,
     apply_gpu_throttle_temp,
@@ -108,12 +114,15 @@ def _run_tuning_with_hotkey(state: SessionState) -> None:
                 print("Revert complete. Exiting cleanly.")
             except Exception as ex:
                 print(f"WARNING: Revert failed during interrupt handling: {ex}")
+<<<<<<< HEAD
     except PointLockError:
         # Do not shrink the search boundary for an unexercised/unsupported point.
         # A failed lock restore retains its journal; leave recovery explicit.
         if not (Path(state.out_dir) / "point_lock_recovery.json").exists():
             revert_to_last_good(state)
         raise
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     except Exception as ex:
         print(f"\nFatal error during tuning: {ex}")
         _reset_board_to_factory_defaults(state)
@@ -167,6 +176,7 @@ def main() -> int:
     signal.signal(signal.SIGINT, signal_handler)
     try:
         args = parse_args()
+<<<<<<< HEAD
         if args.command in ("run", "resume"):
             journal = Path(args.out) / "point_lock_recovery.json"
             if journal.exists():
@@ -189,6 +199,10 @@ def main() -> int:
             restore_point_lock(Path(args.out) / "point_lock_recovery.json")
             print("Previous point-lock state restored and verified.")
             return 0
+=======
+        if args.command in ("dump", "run", "resume"):
+            warn_if_not_admin()
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
         
         if args.command == "dump":
             out_dir = Path(args.out)
@@ -236,7 +250,10 @@ def main() -> int:
                 stress_timeout=args.stress_timeout,
                 vlock_target_mv=_resolve_arg(args, profile, "target_voltage_mv", "target_voltage_mv", 950),
                 vlock_start_freq_mhz=args.vlock_start_freq_mhz,
+<<<<<<< HEAD
                 point_lock=args.point_lock,
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
                 mvscan_objective=args.mvscan_objective,
                 power_limit_pct=args.power_limit_pct,
                 gpu_throttle_temp_c=args.gpu_throttle_temp_c,
@@ -273,9 +290,12 @@ def main() -> int:
             _normalize_state_controls(state)
             _apply_pre_tune_controls(state)
             _run_tuning_with_hotkey(state)
+<<<<<<< HEAD
     except PointLockError as ex:
         print(f"Point test stopped: {ex}")
         return 1
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     except KeyboardInterrupt:
         print("\nInterrupted by user. Exiting cleanly.")
         return 130

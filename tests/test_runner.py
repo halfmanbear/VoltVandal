@@ -41,7 +41,13 @@ def test_run_doloming_writes_log_on_monitor_abort(tmp_path: Path):
     )
 
     assert rc == 999
+<<<<<<< HEAD
     assert out_text.rstrip().endswith("ABORTED_BY_MONITOR")
     assert log_path.exists()
     assert "ABORTED_BY_MONITOR" in log_path.read_text(encoding="utf-8")
     assert out_text == log_path.read_text(encoding="utf-8")
+=======
+    assert out_text == "ABORTED_BY_MONITOR"
+    assert log_path.exists()
+    assert "ABORTED_BY_MONITOR" in log_path.read_text(encoding="utf-8")
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef

@@ -43,6 +43,7 @@ python voltvandal.py run --mode vlock --gpu-profile rtx30 --gpu 0
 python voltvandal.py resume --out artifacts
 ```
 
+<<<<<<< HEAD
 ### Experimental point testing
 
 `python voltvandal.py point-lock-info --gpu 0` checks the point-lock getter and
@@ -51,6 +52,8 @@ new `run --mode vlock` session to request and verify each tested voltage point.
 See [point tests and recovery](doc/point-lock.md) for coverage requirements,
 API evidence, hardware-validation limits and recovery instructions.
 
+=======
+>>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 ## Structure
 
 - `src/voltvandal/core`: Core logic, session management, and tuning algorithms.
