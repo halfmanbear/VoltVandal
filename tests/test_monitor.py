@@ -1,9 +1,11 @@
 import csv
 from types import SimpleNamespace
 
-import voltvandal.hardware.monitor as monitor_module
+import voltvandal.hardware.monitor.core as monitor_module
 
-from voltvandal.hardware.monitor import _has_actionable_throttle, _next_collapse_streak, _next_throttle_streak
+from voltvandal.hardware.monitor.decode import (
+    _has_actionable_throttle, _next_collapse_streak, _next_throttle_streak,
+)
 from voltvandal.hardware.monitor import NvmlMonitor
 
 
@@ -71,14 +73,14 @@ def test_normal_monitor_records_only_real_voltage_as_measured(monkeypatch, tmp_p
     monitor = NvmlMonitor(0, 1.0, 90, 100, 15, 400, False,
                           tmp_path / "telemetry.csv", measure_voltage=True)
     monitor._voltage_bus = 3
-    monkeypatch.setattr("voltvandal.hardware.monitor.read_voltage_mv",
+    monkeypatch.setattr("voltvandal.hardware.monitor.core.read_voltage_mv",
                         lambda gpu, bus: 887.5)
     assert monitor._sample_voltage(1740, 90) == (887.5, 887.5, "nvapi_measured")
 
     def unavailable(gpu, bus):
         raise RuntimeError("unavailable")
 
-    monkeypatch.setattr("voltvandal.hardware.monitor.read_voltage_mv", unavailable)
+    monkeypatch.setattr("voltvandal.hardware.monitor.core.read_voltage_mv", unavailable)
     monkeypatch.setattr(monitor, "_estimate_voltage_mv_from_curve", lambda clock: 890)
     assert monitor._sample_voltage(1740, 90) == (890, None, "curve_estimate")
     assert not monitor.abort_event.is_set()
@@ -93,7 +95,7 @@ def test_unlocked_curve_point_coverage_uses_measured_loaded_samples(monkeypatch,
     monitor._voltage_bus = 3
     measured = [887.5, 806.25, 806.25]
     monkeypatch.setattr(
-        "voltvandal.hardware.monitor.read_voltage_mv",
+        "voltvandal.hardware.monitor.core.read_voltage_mv",
         lambda gpu, bus: measured.pop(0),
     )
     monitor._sample_voltage(1860, 50)

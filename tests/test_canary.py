@@ -1,6 +1,6 @@
 import numpy as np
 
-from voltvandal.core.tuning import _parse_doloming_stability
+from voltvandal.core.tuning.stability import _parse_doloming_stability
 from voltvandal.stress import runner
 from voltvandal.stress.canary import int_chain_reference, ramp_duty
 

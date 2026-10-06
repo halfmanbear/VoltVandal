@@ -1,8 +1,8 @@
 import types
 import sys
 
+from voltvandal.hardware.hotkey import _parse_windows_hotkey
 from voltvandal.hardware.runtime_controls import (
-    _parse_windows_hotkey,
     apply_fan_control,
     apply_gpu_throttle_temp,
     apply_power_limit_percent,

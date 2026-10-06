@@ -2,10 +2,16 @@
 import sys
 import os
 
-# Add src to sys.path so we can import the package without installation
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
+SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "src")
 
-from voltvandal.main import main
+if __name__ != "__main__":
+    # Imported as `voltvandal` from this folder (e.g. `python -m voltvandal.main`):
+    # this file shadows the real package, so act as that package instead.
+    __path__ = [os.path.join(SRC, "voltvandal")]
+else:
+    # Add src to sys.path so we can import the package without installation
+    sys.path.insert(0, SRC)
 
-if __name__ == "__main__":
-    main()
+    from voltvandal.main import main
+
+    raise SystemExit(main())
