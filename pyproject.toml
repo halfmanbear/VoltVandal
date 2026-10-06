@@ -28,10 +28,7 @@ voltvandal = "voltvandal.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-<<<<<<< HEAD
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef

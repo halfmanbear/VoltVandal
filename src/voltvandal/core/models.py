@@ -72,18 +72,25 @@ class SessionState:
                                        # -1 = not started; counts down from anchor_idx-1 to 0
     vlock_p2_current_gain_khz: int = 0 # Phase 2: gain currently being tested for the active bin
                                        # 0 = use full oc_gain on next bin entry
-    vlock_phase: str = "oc"            # "oc" | "uv" | "done"
+    vlock_phase: str = "oc"            # "oc" | "uv" | "done" | "failed" | "inconclusive"
     vlock_oc_base_freq_khz: int = 0    # freq floor found by floor-search (0 = use stock)
     vlock_start_freq_mhz: int = 0     # Phase 1 OC search start frequency (MHz), 0 = base/stock
     vlock_last_fail_step: int = -1    # Phase 1 coarse->fine boundary (failing coarse step, -1 = coarse mode)
     mvscan_objective: str = "balanced"  # balanced | max-clock | min-cap
-<<<<<<< HEAD
     point_lock: bool = False           # opt-in verified point tests for vlock
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
+    point_util_pct: int = 0            # matrix/ray target utilization for locked point tests (0 = stress default)
+    auto_plan: bool = False             # choose a contiguous vlock sweep from measured stress coverage
+    auto_plan_probe_done: bool = False
+    auto_plan_modes: str = ""          # stress modes available for final validation
+    auto_plan_min_bin_idx: int = -1     # lowest lower-voltage bin selected by loaded measurements
+    auto_plan_fallback_full: bool = False
+    anchor_max_gain_mhz: int = 0       # anchor mode: hard ceiling on tested gain (0 = safe default)
+    anchor_finish: bool = False        # anchor mode: build from proven gains only, run no new search
+    active_candidate_label: str = ""  # persisted before a vlock test; survives an OS/process crash
 
     # power limit
     power_limit_pct: int = 100        # % of GPU default TDP to apply before run (100 = unchanged)
+    power_limit_max: bool = False     # use this GPU's firmware-reported maximum power limit
     gpu_throttle_temp_c: int = 0      # real GPU throttle target temp via nvidia-smi -gtt (0 = unchanged)
     gpu_throttle_temp_restore_c: int = 0  # captured pre-run target temp to restore on emergency reset
     fan_mode: str = "auto"            # requested fan mode: auto|manual
@@ -111,9 +118,11 @@ class MonitorSnapshot:
     mem_clock_mhz: int
     util_gpu: int
     throttle_reasons: int
-    voltage_mv: Optional[int] = None
+    voltage_mv: Optional[float] = None
     voltage_estimated: bool = False
     pstate: Optional[int] = None
     perf_decrease: Optional[int] = None
     topo_gpu_mw: Optional[int] = None
     topo_total_mw: Optional[int] = None
+    measured_voltage_mv: Optional[float] = None
+    voltage_source: str = "unavailable"

@@ -1,8 +1,5 @@
 import json
-<<<<<<< HEAD
 import os
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import Tuple
@@ -18,16 +15,10 @@ def session_paths(out_dir: Path) -> Tuple[Path, Path, Path]:
 
 def save_session(state: SessionState) -> None:
     state.updated_utc = now_utc_iso()
-<<<<<<< HEAD
     dest = Path(state.checkpoint_json)
     tmp = dest.with_suffix(".tmp")
     tmp.write_text(json.dumps(asdict(state), indent=2), encoding="utf-8")
     os.replace(tmp, dest)
-=======
-    Path(state.checkpoint_json).write_text(
-        json.dumps(asdict(state), indent=2), encoding="utf-8"
-    )
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 
 def load_session(out_dir: Path) -> SessionState:
     _, _, checkpoint = session_paths(out_dir)

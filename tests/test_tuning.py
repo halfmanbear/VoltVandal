@@ -5,12 +5,9 @@ import json
 import threading
 
 from voltvandal.core.models import SessionState, CandidateResult, CurvePoint
-<<<<<<< HEAD
 from contextlib import contextmanager
 from voltvandal.core import tuning
 from voltvandal.hardware.point_lock import PointLockError
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 from voltvandal.core.tuning import (
     run_session,
     evaluate_candidate,
@@ -52,7 +49,6 @@ def mock_state(tmp_path):
         abort_on_throttle=True,
     )
 
-<<<<<<< HEAD
 
 @pytest.fixture
 def point_test(monkeypatch, mock_state):
@@ -110,6 +106,40 @@ def test_insufficient_coverage_is_inconclusive_and_restores(mock_state, point_te
     monitor.stop.assert_called_once()
 
 
+def test_unlocked_lower_bin_without_loaded_coverage_is_inconclusive(mock_state, point_test):
+    monitor, calls, event = point_test
+    mock_state.point_lock = False
+    monitor.point_coverage.return_value = dict(
+        loaded_samples=100, measured_samples=100, matched_samples=0,
+        coverage_pct=0.0, target_voltage_mv=900.0, target_clock_mhz=1800.0,
+    )
+    result = evaluate_candidate(
+        mock_state, Path(mock_state.stock_curve_csv), "lower", event,
+        threading.Event(), target_point=CurvePoint(900000, 1800000),
+    )
+    assert not result.ok
+    assert result.reason.startswith("INCONCLUSIVE_BIN_COVERAGE")
+    assert "0/100 loaded samples" in result.reason
+    assert calls == []  # No voltage lock was requested.
+    assert tuning.NvmlMonitor.call_args.kwargs["point_voltage_mv"] == 900.0
+    assert tuning.NvmlMonitor.call_args.kwargs["point_lock_bus"] is None
+
+
+def test_unlocked_lower_bin_passes_with_loaded_coverage(mock_state, point_test):
+    monitor, calls, event = point_test
+    mock_state.point_lock = False
+    monitor.point_coverage.return_value = dict(
+        loaded_samples=100, measured_samples=100, matched_samples=90,
+        coverage_pct=90.0, target_voltage_mv=900.0, target_clock_mhz=1800.0,
+    )
+    result = evaluate_candidate(
+        mock_state, Path(mock_state.stock_curve_csv), "lower", event,
+        threading.Event(), target_point=CurvePoint(900000, 1800000),
+    )
+    assert result.ok
+    assert calls == []
+
+
 @pytest.mark.parametrize("failure", [RuntimeError("spawn failed"), KeyboardInterrupt()])
 def test_point_workload_exceptions_cleanup(mock_state, point_test, failure):
     monitor, calls, event = point_test
@@ -128,6 +158,100 @@ def test_point_timeout_does_not_count_as_instability(mock_state, point_test):
         evaluate_candidate(mock_state, Path(mock_state.stock_curve_csv), "point", event,
                            threading.Event(), target_point=CurvePoint(900000, 1800000))
     assert calls[-1][0] == "restore"
+
+
+@pytest.mark.parametrize(
+    ("driver_reset", "abort_reason", "expected"),
+    [
+        (True, "GPU_LOST", "GPU_DRIVER_RESET_DETECTED"),
+        (False, "TELEMETRY_UNAVAILABLE", "MONITOR_ABORT_THRESHOLD:TELEMETRY_UNAVAILABLE"),
+    ],
+)
+def test_monitor_abort_takes_priority_over_stress_exit_code(
+    mock_state, point_test, driver_reset, abort_reason, expected
+):
+    monitor, _, event = point_test
+    mock_state.point_lock = False
+    mock_state.doloming_modes = "simple,ray"
+    monitor.driver_reset_detected = driver_reset
+    monitor.abort_reason = abort_reason
+
+    def aborted(*args, **kwargs):
+        monitor.abort_event.set()
+        return 999, "ABORTED_BY_MONITOR"
+
+    tuning.run_doloming.side_effect = aborted
+    result = evaluate_candidate(
+        mock_state, Path(mock_state.stock_curve_csv), "probe", event, threading.Event()
+    )
+    assert not result.ok
+    assert result.reason == expected
+    assert result.stress_exit_codes == {"doloming_simple": 999}
+    assert tuning.run_doloming.call_count == 1
+
+
+def test_unknown_monitor_abort_cannot_become_probe_fallback(mock_state, point_test):
+    _, _, event = point_test
+    mock_state.point_lock = False
+    mock_state.doloming_modes = "simple,ray"
+    tuning.run_doloming.return_value = (999, "ABORTED_BY_MONITOR")
+    result = evaluate_candidate(
+        mock_state, Path(mock_state.stock_curve_csv), "probe", event, threading.Event()
+    )
+    assert result.reason == "MONITOR_ABORT_UNKNOWN"
+    assert tuning.run_doloming.call_count == 1
+
+
+def test_cuda_error_is_reported_even_when_monitor_also_aborts(mock_state, point_test):
+    monitor, _, event = point_test
+    mock_state.point_lock = False
+    monitor.driver_reset_detected = False
+    monitor.abort_reason = "TELEMETRY_UNAVAILABLE"
+
+    def failed(*args, **kwargs):
+        monitor.abort_event.set()
+        return 999, (
+            "Error during test: access violation\n"
+            "Error in GPU computation: CUDA_ERROR_ILLEGAL_ADDRESS\n"
+            "ABORTED_BY_MONITOR"
+        )
+
+    tuning.run_doloming.side_effect = failed
+    result = evaluate_candidate(
+        mock_state, Path(mock_state.stock_curve_csv), "candidate", event,
+        threading.Event(),
+    )
+    assert result.reason == "DOLOMING_SIMPLE_CUDA_RUNTIME_ERROR"
+    assert not result.ok
+
+
+def test_vlock_stops_after_cuda_runtime_error(mock_state):
+    mock_state.mode = "vlock"
+    mock_state.vlock_target_mv = 900
+    failure = CandidateResult(False, "HARD_FAIL:DOLOMING_SIMPLE_CUDA_RUNTIME_ERROR")
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=failure):
+        with pytest.raises(RuntimeError, match="CUDA_RUNTIME_ERROR"):
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert mock_state.current_step == 0
+    assert mock_state.vlock_phase == "failed"
+    assert mock_state.active_candidate_label.startswith("vlock_p1_step000")
+
+
+def test_vlock_persists_active_candidate_before_evaluation(mock_state):
+    mock_state.mode = "vlock"
+    mock_state.vlock_target_mv = 900
+
+    def interrupted(*args, **kwargs):
+        assert mock_state.active_candidate_label.startswith("vlock_p1_step000")
+        assert json.loads(Path(mock_state.checkpoint_json).read_text())[
+            "active_candidate_label"
+        ] == mock_state.active_candidate_label
+        raise KeyboardInterrupt("simulated shutdown")
+
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", side_effect=interrupted):
+        with pytest.raises(KeyboardInterrupt):
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert mock_state.active_candidate_label
 
 
 def test_point_capability_failure_does_not_apply_curve(mock_state, point_test):
@@ -153,8 +277,6 @@ def test_second_workload_must_also_cover_the_point(mock_state, point_test):
     assert tuning.run_doloming.call_count == 2
     assert calls[-1][0] == "restore"
 
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 @patch("voltvandal.core.tuning.nvapi_apply_curve_safe")
 @patch("voltvandal.core.tuning.run_doloming")
 @patch("voltvandal.core.tuning.NvmlMonitor")
@@ -315,6 +437,26 @@ def test_run_vlock_session_p2_break(mock_load, mock_apply, mock_eval, mock_state
     assert mock_state.vlock_phase == "uv"
 
 
+def test_vlock_phase2_stops_and_reverts_unexercised_bin(mock_state):
+    mock_state.mode = "vlock"
+    mock_state.vlock_phase = "uv"
+    mock_state.vlock_uv_bin_idx = 0
+    mock_state.vlock_target_mv = 950
+    mock_state.vlock_anchor_freq_khz = 1900000
+    before = Path(mock_state.last_good_curve_csv).read_bytes()
+    inconclusive = CandidateResult(False, "HARD_FAIL:INCONCLUSIVE_BIN_COVERAGE: simple: 0/100 loaded samples")
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=inconclusive) as evaluate:
+        with patch("voltvandal.core.tuning.revert_to_last_good") as revert:
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert evaluate.call_count == 1
+    assert evaluate.call_args.kwargs["target_point"] == CurvePoint(900000, 1800000)
+    revert.assert_called_once_with(mock_state)
+    assert Path(mock_state.last_good_curve_csv).read_bytes() == before
+    assert mock_state.vlock_phase == "inconclusive"
+    assert mock_state.vlock_uv_bin_idx == 0
+    assert mock_state.active_candidate_label == ""
+
+
 @patch("voltvandal.core.tuning.evaluate_candidate_confident")
 @patch("voltvandal.core.tuning.nvapi_apply_curve_safe")
 @patch("voltvandal.core.tuning.load_curve_csv")
@@ -468,6 +610,124 @@ def test_run_vlock_session_step0_fail_does_not_jump_above_initial_fail(mock_load
     assert max(freqs) == 1980
 
 
+def _plan_metrics(minimum_mv):
+    return {
+        "loaded_sample_count": 40,
+        "measured_loaded_sample_count": 40,
+        "min_measured_loaded_voltage_mv": minimum_mv,
+        "sustained_min_measured_loaded_voltage_mv": minimum_mv,
+    }
+
+
+def _configure_auto_plan_phase2(state):
+    rows = "voltageUV,frequencyKHz\n" + "".join(
+        f"{mv * 1000},{freq * 1000}\n"
+        for mv, freq in ((800, 1200), (825, 1300), (850, 1400),
+                         (875, 1500), (900, 1600), (925, 1700))
+    )
+    Path(state.stock_curve_csv).write_text(rows, encoding="utf-8")
+    Path(state.last_good_curve_csv).write_text(rows, encoding="utf-8")
+    state.mode = "vlock"
+    state.vlock_phase = "uv"
+    state.vlock_target_mv = 925
+    state.vlock_anchor_freq_khz = 1760000
+    state.vlock_uv_bin_idx = 4
+    state.auto_plan = True
+    state.auto_plan_probe_done = True
+    state.auto_plan_min_bin_idx = 3
+
+
+def test_auto_plan_expands_after_final_curve_reaches_lower_voltage(mock_state):
+    _configure_auto_plan_phase2(mock_state)
+    candidate = CandidateResult(True, "PASS", metrics=_plan_metrics(925))
+    final_results = [
+        CandidateResult(True, "PASS", metrics=_plan_metrics(875)),
+        CandidateResult(True, "PASS", metrics=_plan_metrics(925)),
+    ]
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=candidate) as evaluate:
+        with patch("voltvandal.core.tuning._run_auto_plan_suite", side_effect=final_results) as final:
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert evaluate.call_count == 4  # bins 4, 3, then newly discovered 2, 1
+    assert final.call_count == 2
+    assert mock_state.vlock_uv_bin_idx == 0
+    assert mock_state.vlock_phase == "done"
+
+
+def test_auto_plan_missing_measurements_completes_full_sweep(mock_state):
+    _configure_auto_plan_phase2(mock_state)
+    candidate = CandidateResult(True, "PASS", metrics=None)
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=candidate) as evaluate:
+        with patch("voltvandal.core.tuning._run_auto_plan_suite", return_value=candidate):
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert evaluate.call_count == 5
+    assert mock_state.auto_plan_fallback_full
+    assert mock_state.vlock_phase == "done"
+
+
+def test_auto_plan_final_failure_restores_stock_curve(mock_state):
+    _configure_auto_plan_phase2(mock_state)
+    passing = CandidateResult(True, "PASS", metrics=_plan_metrics(925))
+    failing = CandidateResult(False, "DOLOMING_RAY_RC_1")
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=passing):
+        with patch("voltvandal.core.tuning._run_auto_plan_suite", return_value=failing):
+            with patch("voltvandal.core.tuning.nvapi_apply_curve_safe") as apply:
+                tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    apply.assert_called_once_with(0, Path(mock_state.stock_curve_csv), timeout_seconds=12.0)
+    assert Path(mock_state.last_good_curve_csv).read_bytes() == Path(mock_state.stock_curve_csv).read_bytes()
+    assert mock_state.vlock_phase == "failed"
+
+
+def test_auto_plan_suite_restores_stress_settings_on_error(mock_state):
+    mock_state.doloming_modes = "ray"
+    mock_state.multi_stress_seconds = 40
+    mock_state.gpuburn = "gpu-burn"
+    with patch("voltvandal.core.tuning.evaluate_candidate", side_effect=RuntimeError("probe failed")):
+        with pytest.raises(RuntimeError, match="probe failed"):
+            tuning._run_auto_plan_suite(
+                mock_state, Path(mock_state.stock_curve_csv), "probe", 20,
+                threading.Event(), threading.Event(),
+            )
+    assert mock_state.doloming_modes == "ray"
+    assert mock_state.multi_stress_seconds == 40
+    assert mock_state.gpuburn == "gpu-burn"
+
+
+def test_auto_plan_probe_failure_stops_before_tuning(mock_state):
+    mock_state.mode = "vlock"
+    mock_state.auto_plan = True
+    mock_state.vlock_target_mv = 950
+    mock_state.max_steps = 0
+    probe_failure = CandidateResult(False, "DOLOMING_MATRIX_RC_996")
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident") as evaluate:
+        with patch("voltvandal.core.tuning._run_auto_plan_suite",
+                   return_value=probe_failure):
+            with pytest.raises(RuntimeError, match="DOLOMING_MATRIX_RC_996"):
+                tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    evaluate.assert_not_called()
+    assert not mock_state.auto_plan_probe_done
+
+
+def test_auto_plan_stock_probe_selects_shorter_contiguous_sweep(mock_state):
+    _configure_auto_plan_phase2(mock_state)
+    mock_state.vlock_phase = "oc"
+    mock_state.vlock_uv_bin_idx = -1
+    mock_state.auto_plan_probe_done = False
+    mock_state.auto_plan_min_bin_idx = -1
+    mock_state.max_steps = 0
+    mock_state.current_step = 0
+    passing = CandidateResult(True, "PASS", metrics=_plan_metrics(925))
+    with patch("voltvandal.core.tuning.evaluate_candidate_confident", return_value=passing) as evaluate:
+        with patch("voltvandal.core.tuning._run_auto_plan_suite",
+                   side_effect=[passing, passing]) as suite:
+            tuning.run_vlock_session(mock_state, threading.Event(), threading.Event())
+    assert suite.call_count == 2
+    assert suite.call_args_list[0].args[2] == "vlock_plan_stock_probe"
+    assert evaluate.call_count == 3  # anchor and only two selected lower bins
+    assert mock_state.auto_plan_probe_done
+    assert mock_state.auto_plan_min_bin_idx == 3
+    assert mock_state.vlock_phase == "done"
+
+
 @patch("voltvandal.core.tuning.evaluate_candidate")
 def test_evaluate_candidate_confident_enforces_warmup_minimum(mock_eval, mock_state):
     mock_state.stress_seconds = 12
@@ -516,4 +776,3 @@ def test_evaluate_candidate_confident_default_skips_warmup(mock_eval, mock_state
     # First call is run1 (no warmup), so durations stay unchanged.
     assert captured_durations[0][0] == 12
     assert captured_durations[0][1] == 10
-

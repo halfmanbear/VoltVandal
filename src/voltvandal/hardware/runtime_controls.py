@@ -111,6 +111,29 @@ def apply_power_limit_percent(gpu_index: int, power_limit_pct: int) -> Optional[
     return msg
 
 
+def apply_power_limit_max(gpu_index: int) -> str:
+    """Apply the selected GPU's reported maximum power limit via NVML."""
+    pynvml = _require_pynvml()
+    try:
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
+        _, max_mw = pynvml.nvmlDeviceGetPowerManagementLimitConstraints(handle)
+        max_mw = int(max_mw)
+        current_mw = int(pynvml.nvmlDeviceGetPowerManagementLimit(handle))
+        if current_mw != max_mw:
+            pynvml.nvmlDeviceSetPowerManagementLimit(handle, max_mw)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to apply --power-limit-max on GPU {gpu_index}: {exc}"
+        ) from exc
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+    return f"Applied GPU {gpu_index} maximum power limit: {max_mw / 1000.0:.1f} W."
+
+
 def reset_power_limit_default(gpu_index: int) -> str:
     """Reset GPU power limit to driver default via NVML."""
     pynvml = _require_pynvml()

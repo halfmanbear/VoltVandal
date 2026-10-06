@@ -1,10 +1,11 @@
 import csv
+import os
 import shutil
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     import pynvml
@@ -14,10 +15,7 @@ except ImportError:
 from ..core.models import MonitorSnapshot, CurvePoint
 from ..core.utils import eprint, now_utc_iso
 from ..core.curve import load_curve_csv
-<<<<<<< HEAD
 from .point_lock import read_voltage_mv
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
 
 # Import native nvapi if available
 try:
@@ -25,12 +23,19 @@ try:
 except ImportError:
     _nvapi_native = None
 
-_TDR_MIN_BOOST_MHZ:  int = 1200
-_TDR_BASE_CLOCK_MHZ: int = 600
-_TDR_ARM_MIN_UTIL_PCT: int = 35
-_TDR_MIN_SECONDS_BEFORE_DETECT: float = 8.0
-_TDR_COLLAPSE_POLLS: int = 3
 _THROTTLE_ABORT_CONSECUTIVE_POLLS: int = 3
+# A hung GPU keeps its clock but its power falls far below what the run has
+# already shown it draws (seen before the 0x116 TDR crash). Abort early.
+_COLLAPSE_MIN_PEAK_W: float = 150.0
+_COLLAPSE_POWER_RATIO: float = 0.45
+_COLLAPSE_ABORT_CONSECUTIVE_POLLS: int = 5
+
+_TELEMETRY_COLUMNS = [
+    "utc", "temp_c", "hotspot_c", "vram_junction_c", "power_w",
+    "clock_mhz", "mem_clock_mhz", "util_gpu", "voltage_mv",
+    "throttle_reasons", "pstate", "perf_decrease", "topo_gpu_mw",
+    "topo_total_mw", "measured_voltage_mv", "voltage_source",
+]
 
 _THROTTLE_LABELS = {
     0x0000000000000001: "Idle",
@@ -86,6 +91,13 @@ def _decode_perf_decrease(info: Optional[int]) -> str:
 def _next_throttle_streak(prev_streak: int, reasons: int) -> int:
     return prev_streak + 1 if _has_actionable_throttle(reasons) else 0
 
+def _next_collapse_streak(prev_streak: int, power_w: float, peak_power_w: float) -> int:
+    collapsed = (
+        peak_power_w >= _COLLAPSE_MIN_PEAK_W
+        and power_w < peak_power_w * _COLLAPSE_POWER_RATIO
+    )
+    return prev_streak + 1 if collapsed else 0
+
 def _fmt_signed_int(value: int) -> str:
     return f"+{value}" if value >= 0 else str(value)
 
@@ -107,13 +119,11 @@ class NvmlMonitor:
         expected_test_seconds: Optional[int] = None,
         live_display: bool = True,
         use_nvapi_live: bool = False,
-<<<<<<< HEAD
+        measure_voltage: bool = False,
         point_lock_bus: Optional[int] = None,
         point_voltage_mv: float = 0.0,
         point_clock_mhz: float = 0.0,
         point_voltage_tolerance_mv: float = 3.0,
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     ):
         self.gpu_index = gpu_index
         self.poll_seconds = poll_seconds
@@ -130,15 +140,15 @@ class NvmlMonitor:
         self.expected_test_seconds = expected_test_seconds
         self.live_display = live_display
         self.use_nvapi_live = use_nvapi_live
-<<<<<<< HEAD
+        self.measure_voltage = measure_voltage
         self.point_lock_bus = point_lock_bus
+        self._voltage_bus: Optional[int] = point_lock_bus
+        self._voltage_read_errors = 0
+        self._voltage_read_disabled = False
         self.point_voltage_mv = point_voltage_mv
         self.point_clock_mhz = point_clock_mhz
         self.point_voltage_tolerance_mv = point_voltage_tolerance_mv
         self._point_counts = (0, 0, 0)  # loaded samples, valid voltage, on-target
-        self._point_read_errors = 0
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
         self._live_line_len: int = 0
 
         self.stop_event = threading.Event()
@@ -158,17 +168,33 @@ class NvmlMonitor:
         self._sticky_warn_text: str = ""
 
         self.driver_reset_detected: bool = False
-        self._had_boost_clock: bool = False
-        self._tdr_collapse_polls: int = 0
         self._actionable_throttle_streak: int = 0
+        self._collapse_streak: int = 0
+        self._collapse_peak_w: float = 0.0
+        self._collapse_armed: bool = False
         self._started_monotonic: float = time.monotonic()
         self._sample_count: int = 0
+        self._loaded_sample_count: int = 0
+        self._measured_loaded_voltages_mv: List[float] = []
+        self._voltage_streak_mv: List[Tuple[float, float]] = []
+        self._sustained_min_voltage_mv: Optional[float] = None
         self._clock_samples: List[int] = []
         self._clock_sum_mhz: float = 0.0
         self._throttle_any_count: int = 0
         self._throttle_pwr_count: int = 0
         self._throttle_severe_count: int = 0
         self._throttle_label_counts: Dict[str, int] = {}
+
+    def arm_collapse_check(self) -> None:
+        """Start hang detection for one stress process, forgetting earlier runs' peak."""
+        self._collapse_peak_w = 0.0
+        self._collapse_streak = 0
+        self._collapse_armed = True
+
+    def disarm_collapse_check(self) -> None:
+        """Stop hang detection; stress spin-up/spin-down power dips are expected."""
+        self._collapse_armed = False
+        self._collapse_streak = 0
 
     def _estimate_voltage_mv_from_curve(self, clock_mhz: int) -> Optional[int]:
         return self._estimate_voltage_mv_from_points(clock_mhz, stock=False)
@@ -227,25 +253,71 @@ class NvmlMonitor:
         pynvml.nvmlInit()
         try:
             self.handle = pynvml.nvmlDeviceGetHandleByIndex(self.gpu_index)
+            if self.measure_voltage and self.point_lock_bus is None:
+                try:
+                    pci = pynvml.nvmlDeviceGetPciInfo(self.handle)
+                    if pci.domain == 0:
+                        self._voltage_bus = int(pci.bus)
+                except Exception:
+                    self._voltage_bus = None
         except Exception:
             pynvml.nvmlShutdown()
             raise
 
-        first = not self.log_csv.exists()
-        with self.log_csv.open("a", newline="") as f:
-            w = csv.writer(f)
-            if first:
-                w.writerow(
-                    [
-                        "utc", "temp_c", "hotspot_c", "vram_junction_c",
-                        "power_w", "clock_mhz", "mem_clock_mhz", "util_gpu",
-                        "voltage_mv", "throttle_reasons", "pstate",
-                        "perf_decrease", "topo_gpu_mw", "topo_total_mw",
-                    ]
-                )
+        self._ensure_telemetry_header()
 
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def _ensure_telemetry_header(self) -> None:
+        if not self.log_csv.exists() or self.log_csv.stat().st_size == 0:
+            with self.log_csv.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(_TELEMETRY_COLUMNS)
+            return
+        with self.log_csv.open(newline="", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            header = next(reader)
+            if header == _TELEMETRY_COLUMNS:
+                return
+            if header != _TELEMETRY_COLUMNS[:-2]:
+                raise ValueError(f"Unrecognised telemetry columns in {self.log_csv}")
+            temp = self.log_csv.with_suffix(".tmp")
+            with temp.open("w", newline="", encoding="utf-8") as out:
+                writer = csv.writer(out)
+                writer.writerow(_TELEMETRY_COLUMNS)
+                for row in reader:
+                    writer.writerow(row + ["", "legacy_unknown"])
+        os.replace(temp, self.log_csv)
+
+    def _sample_voltage(self, clock_mhz: int, utilization: int) -> Tuple[Optional[float], Optional[float], str]:
+        measured_mv = None
+        bus = self._voltage_bus
+        if bus is not None and not self._voltage_read_disabled:
+            try:
+                value = float(read_voltage_mv(self.gpu_index, bus))
+                if 400 <= value <= 1500:
+                    measured_mv = value
+                    self._voltage_read_errors = 0
+                else:
+                    self._voltage_read_errors += 1
+            except Exception:
+                self._voltage_read_errors += 1
+            if self._voltage_read_errors >= 3:
+                if self.point_lock_bus is not None:
+                    self.abort_reason = "POINT_VOLTAGE_UNAVAILABLE"
+                    self.abort_event.set()
+                else:
+                    self._voltage_read_disabled = True
+        # Coverage also matters for ordinary vlock lower-bin tests: a stress
+        # pass at the anchor cannot validate a lower point the GPU never used.
+        if self.point_lock_bus is not None or (self.point_voltage_mv > 0 and self.point_clock_mhz > 0):
+            self._record_point_sample(measured_mv, clock_mhz, utilization)
+        if measured_mv is not None:
+            return measured_mv, measured_mv, "nvapi_measured"
+        estimated_mv = self._estimate_voltage_mv_from_curve(clock_mhz)
+        if estimated_mv is not None and 400 <= estimated_mv <= 2000:
+            return estimated_mv, None, "curve_estimate"
+        return None, None, "unavailable"
 
     def _loop(self) -> None:
         while not self.stop_event.is_set():
@@ -259,8 +331,6 @@ class NvmlMonitor:
 
                 hotspot: float = temp + self.hotspot_offset_c
                 vram_junc: Optional[float] = None
-                voltage_mv: Optional[int] = None
-                voltage_estimated = False
                 pstate: Optional[int] = None
                 perf_decrease: Optional[int] = None
                 topo_gpu_mw: Optional[int] = None
@@ -272,10 +342,6 @@ class NvmlMonitor:
                         if thr["hotspot_c"] is not None:
                             hotspot = thr["hotspot_c"]
                         vram_junc = thr.get("vram_junction_c")
-                    except Exception:
-                        pass
-                    try:
-                        voltage_mv = _nvapi_native.get_current_voltage_mv(self.gpu_index)
                     except Exception:
                         pass
                     try:
@@ -294,38 +360,21 @@ class NvmlMonitor:
                     except Exception:
                         pass
 
-<<<<<<< HEAD
-                if self.point_lock_bus is not None:
-                    try:
-                        voltage_mv = read_voltage_mv(self.gpu_index, self.point_lock_bus)
-                        self._point_read_errors = 0
-                    except Exception:
-                        voltage_mv = None
-                        self._point_read_errors += 1
-                        if self._point_read_errors >= 3:
-                            self.abort_reason = "POINT_VOLTAGE_UNAVAILABLE"
-                            self.abort_event.set()
-                    self._record_point_sample(voltage_mv, clock, util)
-
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
-                if voltage_mv is not None:
-                    if voltage_mv > 20000:
-                        voltage_mv = int(round(voltage_mv / 1000.0))
-                    if voltage_mv < 400 or voltage_mv > 2000:
-                        voltage_mv = None
-                if voltage_mv is None:
-                    _est = self._estimate_voltage_mv_from_curve(clock)
-                    if _est is not None and 400 <= _est <= 2000:
-                        voltage_mv = _est
-                        voltage_estimated = True
+                voltage_mv, measured_voltage_mv, voltage_source = self._sample_voltage(clock, util)
+                voltage_estimated = voltage_source == "curve_estimate"
 
                 snap = MonitorSnapshot(
                     temp, hotspot, vram_junc, power, clock, mem_clock, util, throttle,
                     voltage_mv, voltage_estimated, pstate, perf_decrease, topo_gpu_mw, topo_total_mw,
+                    measured_voltage_mv, voltage_source,
                 )
                 self.last_snapshot = snap
                 self._sample_count += 1
+                if util >= 35:
+                    self._loaded_sample_count += 1
+                    if measured_voltage_mv is not None:
+                        self._measured_loaded_voltages_mv.append(measured_voltage_mv)
+                self._record_sustained_voltage_sample(measured_voltage_mv, util, throttle)
                 self._clock_samples.append(clock)
                 self._clock_sum_mhz += float(clock)
                 throttle_no_idle = throttle & ~_THROTTLE_IDLE_BIT
@@ -344,6 +393,11 @@ class NvmlMonitor:
                 self.max_temp = temp if self.max_temp is None else max(self.max_temp, temp)
                 self.max_hotspot = hotspot if self.max_hotspot is None else max(self.max_hotspot, hotspot)
                 self.max_power = power if self.max_power is None else max(self.max_power, power)
+                if self._collapse_armed:
+                    self._collapse_peak_w = max(self._collapse_peak_w, power)
+                    self._collapse_streak = _next_collapse_streak(
+                        self._collapse_streak, power, self._collapse_peak_w
+                    )
                 self._actionable_throttle_streak = _next_throttle_streak(
                     self._actionable_throttle_streak, throttle
                 )
@@ -365,8 +419,12 @@ class NvmlMonitor:
                     w.writerow(
                         [now_utc_iso(), temp, f"{hotspot:.1f}", vram_str,
                          f"{power:.1f}", clock, mem_clock, util, volt_str, throttle_str,
-                         pstate_str, pdec_str, gpu_mw_str, tot_mw_str]
+                         pstate_str, pdec_str, gpu_mw_str, tot_mw_str,
+                         measured_voltage_mv if measured_voltage_mv is not None else "",
+                         voltage_source]
                     )
+                    f.flush()
+                    os.fsync(f.fileno())
 
                 if self.live_display:
                     core_parts = [f"Edge {temp}C", f"Hot {hotspot:.0f}C"]
@@ -382,7 +440,7 @@ class NvmlMonitor:
                     optional_parts.append(f"Mem {mem_clock}MHz")
                     if self.mode == "vlock" and self.vlock_target_mv > 0:
                         target_mv = int(self.vlock_target_mv)
-                        core_parts.append(f"V {target_mv}mV")
+                        optional_parts.append(f"Target {target_mv}mV")
                         stock_mv = self._estimate_stock_voltage_mv(clock)
                         if stock_mv is not None:
                             vdelta_mv = target_mv - stock_mv
@@ -391,7 +449,7 @@ class NvmlMonitor:
                         if stock_freq_mhz is not None:
                             fdelta_mhz = clock - stock_freq_mhz
                             optional_parts.append(f"Fdelta {_fmt_signed_int(fdelta_mhz)}MHz")
-                    elif voltage_mv is not None:
+                    if voltage_mv is not None:
                         core_parts.append(f"V~ {voltage_mv}mV" if voltage_estimated else f"V {voltage_mv}mV")
                     else:
                         core_parts.append("V n/a")
@@ -430,6 +488,12 @@ class NvmlMonitor:
                     if not self.abort_event.is_set():
                         self.abort_reason = f"POWER_{power:.1f}W_GE_{self.power_limit_w:.1f}W"
                     self.abort_event.set()
+                elif self._collapse_armed and self._collapse_streak >= _COLLAPSE_ABORT_CONSECUTIVE_POLLS:
+                    if not self.abort_event.is_set():
+                        self.abort_reason = (
+                            f"GPU_HANG_POWER_COLLAPSE_{power:.0f}W_PEAK_{self._collapse_peak_w:.0f}W"
+                        )
+                    self.abort_event.set()
                 elif self.abort_on_throttle and self._actionable_throttle_streak >= _THROTTLE_ABORT_CONSECUTIVE_POLLS:
                     if not self.abort_event.is_set():
                         self.abort_reason = (
@@ -438,25 +502,48 @@ class NvmlMonitor:
                         )
                     self.abort_event.set()
 
-                if clock >= _TDR_MIN_BOOST_MHZ and util >= _TDR_ARM_MIN_UTIL_PCT:
-                    self._had_boost_clock = True
-                _elapsed_s = time.monotonic() - self._started_monotonic
-                if self._had_boost_clock and _elapsed_s >= _TDR_MIN_SECONDS_BEFORE_DETECT and clock <= _TDR_BASE_CLOCK_MHZ and util <= 20 and (pstate is None or pstate >= 5):
-                    self._tdr_collapse_polls += 1
-                else:
-                    self._tdr_collapse_polls = 0
-                if self._tdr_collapse_polls >= _TDR_COLLAPSE_POLLS and not self.driver_reset_detected:
-                    self.driver_reset_detected = True
-                    eprint("\n  !! GPU DRIVER RESET (TDR) detected. Aborting.")
-                    self.abort_event.set()
-
             except Exception as e:
+                self._voltage_streak_mv.clear()
                 self._consecutive_errors += 1
-                if self._consecutive_errors >= 3: self.abort_event.set()
+                if self._consecutive_errors >= 3:
+                    if not self.abort_event.is_set():
+                        self.driver_reset_detected = isinstance(
+                            e, getattr(pynvml, "NVMLError_GpuIsLost", ())
+                        )
+                        self.abort_reason = (
+                            "GPU_LOST" if self.driver_reset_detected else "TELEMETRY_UNAVAILABLE"
+                        )
+                        eprint(
+                            f"\n  !! GPU monitor failed after repeated reads "
+                            f"({type(e).__name__}: {e}). Aborting."
+                        )
+                    self.abort_event.set()
                 self.stop_event.wait(timeout=self.poll_seconds)
                 continue
             self._consecutive_errors = 0
             self.stop_event.wait(timeout=self.poll_seconds)
+
+    def _record_sustained_voltage_sample(
+        self, measured_mv: Optional[float], util: int, throttle: int,
+        sample_time_s: Optional[float] = None,
+    ) -> None:
+        # The driver's Idle throttle flag can appear during a sustained loaded
+        # workload, so require persistence rather than filtering that flag.
+        if measured_mv is None or util < 35:
+            self._voltage_streak_mv.clear()
+            return
+        sample_time_s = time.monotonic() if sample_time_s is None else sample_time_s
+        if self._voltage_streak_mv and (
+            sample_time_s - self._voltage_streak_mv[-1][0] > max(2.5 * self.poll_seconds, 2.5)
+            or abs(measured_mv - self._voltage_streak_mv[0][1]) > 12.5
+        ):
+            self._voltage_streak_mv.clear()
+        self._voltage_streak_mv.append((sample_time_s, measured_mv))
+        if (len(self._voltage_streak_mv) >= 3
+                and sample_time_s - self._voltage_streak_mv[0][0] >= 2.0):
+            lowest = min(value for _, value in self._voltage_streak_mv)
+            if self._sustained_min_voltage_mv is None or lowest < self._sustained_min_voltage_mv:
+                self._sustained_min_voltage_mv = lowest
 
     def _clock_p95_mhz(self) -> Optional[float]:
         if not self._clock_samples:
@@ -468,9 +555,8 @@ class NvmlMonitor:
         idx = max(0, min(idx, len(values) - 1))
         return float(values[idx])
 
-<<<<<<< HEAD
     def _record_point_sample(self, voltage_mv, clock_mhz, utilization):
-        if utilization <= 0:
+        if utilization < 35:
             return
         loaded, measured, matched = self._point_counts
         valid = voltage_mv is not None
@@ -491,8 +577,6 @@ class NvmlMonitor:
                 "target_clock_mhz": self.point_clock_mhz,
                 "voltage_tolerance_mv": self.point_voltage_tolerance_mv}
 
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     def metrics(self) -> Dict[str, float]:
         samples = float(self._sample_count)
         if samples <= 0.0:
@@ -507,6 +591,12 @@ class NvmlMonitor:
                 "throttle_any_count": 0.0,
                 "throttle_pwr_count": 0.0,
                 "throttle_severe_count": 0.0,
+                "loaded_sample_count": 0.0,
+                "measured_loaded_sample_count": 0.0,
+                "measured_loaded_ratio_pct": 0.0,
+                "min_measured_loaded_voltage_mv": 0.0,
+                "sustained_min_measured_loaded_voltage_mv": 0.0,
+                "max_measured_loaded_voltage_mv": 0.0,
             }
         p95 = self._clock_p95_mhz() or 0.0
         max_clock = float(max(self._clock_samples)) if self._clock_samples else 0.0
@@ -521,6 +611,19 @@ class NvmlMonitor:
             "throttle_any_count": float(self._throttle_any_count),
             "throttle_pwr_count": float(self._throttle_pwr_count),
             "throttle_severe_count": float(self._throttle_severe_count),
+            "loaded_sample_count": float(self._loaded_sample_count),
+            "measured_loaded_sample_count": float(len(self._measured_loaded_voltages_mv)),
+            "measured_loaded_ratio_pct": (
+                100.0 * len(self._measured_loaded_voltages_mv) / self._loaded_sample_count
+                if self._loaded_sample_count else 0.0
+            ),
+            "min_measured_loaded_voltage_mv": (
+                min(self._measured_loaded_voltages_mv) if self._measured_loaded_voltages_mv else 0.0
+            ),
+            "sustained_min_measured_loaded_voltage_mv": self._sustained_min_voltage_mv or 0.0,
+            "max_measured_loaded_voltage_mv": (
+                max(self._measured_loaded_voltages_mv) if self._measured_loaded_voltages_mv else 0.0
+            ),
         }
 
     def stop(self) -> None:

@@ -41,7 +41,7 @@ def create_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="Start a new tuning session")
     p_run.add_argument("--gpu", type=int, default=0, help="GPU index")
     p_run.add_argument("--out", type=str, default="artifacts", help="Output directory")
-    p_run.add_argument("--mode", choices=["uv", "oc", "hybrid", "vlock", "mvscan"], required=True, help="Tuning mode: uv, oc, hybrid, vlock, or mvscan")
+    p_run.add_argument("--mode", choices=["uv", "oc", "hybrid", "vlock", "mvscan", "anchor"], required=True, help="Tuning mode: uv, oc, hybrid, vlock, mvscan, or anchor (locked anchor search + interpolation + verification)")
     p_run.add_argument("--gpu-profile", type=str, help="Use a reference profile (e.g. rtx30, rtx40)")
     
     # Tuning params
@@ -50,15 +50,17 @@ def create_parser() -> argparse.ArgumentParser:
     p_run.add_argument("--step-mhz", type=int, default=argparse.SUPPRESS, help="Frequency step size (profile default if omitted)")
     p_run.add_argument("--max-steps", type=int, default=argparse.SUPPRESS, help="Maximum number of steps (profile default if omitted)")
     p_run.add_argument("--vlock-start-freq-mhz", type=int, default=0, help="Phase 1 start frequency for vlock search (0 = start at base/stock)")
-<<<<<<< HEAD
     p_run.add_argument("--point-lock", action="store_true", help="Experimental vlock point tests: lock/read back each voltage bin and require observed voltage/clock coverage")
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
+    p_run.add_argument("--point-util-pct", type=int, default=0, help="Matrix/ray target utilization for locked point tests so power caps do not mask the target point (anchor mode default 60)")
+    p_run.add_argument("--max-gain-mhz", type=int, default=0, help="Anchor mode: hard ceiling on tested gain over stock in MHz (default: profile safe_cap_mhz, else 150)")
+    p_run.add_argument("--aggressive", action="store_true", help="Anchor mode: lift the safe gain ceiling to step-mhz x max-steps. Probing that far can hang the GPU or bluescreen the machine")
+    p_run.add_argument("--anchor-finish", action="store_true", help="Anchor mode: run no new search; build and verify the curve from gains already proven")
+    p_run.add_argument("--auto-plan", action="store_true", help="Automatically select vlock lower bins using measured stress-test voltage; fall back to full sweep if unavailable")
     p_run.add_argument("--mvscan-objective", choices=["balanced", "max-clock", "min-cap"], default="balanced", help="Objective used by mvscan to rank stable voltage caps")
     
     # Stress params
     p_run.add_argument("--stress-seconds", type=int, default=argparse.SUPPRESS, help="Stress duration per step (profile default if omitted)")
-    p_run.add_argument("--doloming-mode", type=str, default="simple", help="Stress mode(s): single mode or comma-separated list (simple,matrix,ray,frequency-max)")
+    p_run.add_argument("--doloming-mode", type=str, default="simple", help="Stress mode(s): single mode or comma-separated list (simple,matrix,ray,frequency-max,canary). canary checks its own results; anchor mode uses it by default")
     p_run.add_argument("--multi-stress-seconds", type=int, default=argparse.SUPPRESS, help="Duration per mode in multi-stress (profile default if omitted)")
     p_run.add_argument("--gpuburn", type=str, help="Path to gpu-burn executable (optional)")
     p_run.add_argument("--stress-timeout", type=int, help="Hard timeout per stress run in seconds")
@@ -80,7 +82,9 @@ def create_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(abort_on_throttle=False)
 
     # Power / fan controls/state
-    p_run.add_argument("--power-limit-pct", type=int, default=100, help="Power limit as %% of GPU default TDP (100 = unchanged)")
+    power_limit_group = p_run.add_mutually_exclusive_group()
+    power_limit_group.add_argument("--power-limit-pct", type=int, default=100, help="Power limit as %% of GPU default TDP (100 = unchanged)")
+    power_limit_group.add_argument("--power-limit-max", action="store_true", help="Apply the selected GPU's maximum supported power limit")
     p_run.add_argument("--gpu-throttle-temp-c", type=int, default=0, help="GPU throttle temp target via nvidia-smi -gtt (0 = unchanged)")
     p_run.add_argument("--fan-mode", choices=["auto", "manual"], default="auto", help="Fan control mode (manual uses NVML APIs where supported)")
     p_run.add_argument("--fan-speed-pct", type=int, default=0, help="Fan speed percent; non-zero automatically forces --fan-mode=manual")
@@ -88,15 +92,20 @@ def create_parser() -> argparse.ArgumentParser:
     # Resume command
     p_res = sub.add_parser("resume", help="Resume a tuning session from checkpoint")
     p_res.add_argument("--out", type=str, default="artifacts", help="Output directory")
+    p_res.add_argument("--anchor-finish", action="store_true", help="Anchor mode: run no new search; build and verify the curve from gains already proven")
+    p_res.add_argument("--max-gain-mhz", type=int, default=0, help="Anchor mode: override the saved ceiling on tested gain over stock (MHz)")
 
-<<<<<<< HEAD
     p_info = sub.add_parser("point-lock-info", help="Read-only point-lock API capability check (no tuning)")
     p_info.add_argument("--gpu", type=int, default=0, help="GPU index")
+    p_ptest = sub.add_parser("point-lock-test", help="Hardware check: lock one bin, read back, observe voltage, restore (no stress, no tuning)")
+    p_ptest.add_argument("--gpu", type=int, default=0, help="GPU index")
+    p_ptest.add_argument("--voltage-mv", type=float, required=True, help="Exposed curve-bin voltage to lock (mV)")
+    p_ptest.add_argument("--out", default="artifacts", help="Directory for the recovery journal")
+    p_ptest.add_argument("--stress-mode", default="", help="Run this built-in stress mode (e.g. matrix, ray, simple) during the hold; implies --hold-seconds 30 if unset")
+    p_ptest.add_argument("--hold-seconds", type=int, default=0, help="Keep the lock and sample voltage/clock/util for N seconds; start a GPU load yourself meanwhile")
     p_recover = sub.add_parser("recover-point-lock", help="Restore the lock saved before an interrupted point test")
     p_recover.add_argument("--out", default="artifacts", help="Session output directory containing point_lock_recovery.json")
 
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
     # Profiles command
     p_prof = sub.add_parser("profiles", help="List available GPU profiles")
 
@@ -119,11 +128,12 @@ def create_parser() -> argparse.ArgumentParser:
 def parse_args():
     parser = create_parser()
     args = parser.parse_args()
-<<<<<<< HEAD
     if args.command == "run" and args.point_lock and args.mode != "vlock":
         parser.error("--point-lock requires --mode vlock")
-=======
->>>>>>> 14f09f6d3f240d9d5b42a9465371456edc1f4bef
+    if args.command == "run" and args.auto_plan and args.mode != "vlock":
+        parser.error("--auto-plan requires --mode vlock")
+    if args.command == "run" and args.auto_plan and args.stress_timeout is not None and args.stress_timeout < 180:
+        parser.error("--auto-plan requires --stress-timeout >= 180 for final validation")
     
     if args.command == "profiles":
         list_profiles()

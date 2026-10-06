@@ -23,6 +23,7 @@ Fields (all values are conservative starting points):
   step_mhz            OC step size per trial (MHz)
   step_mv             UV step size per trial (mV)
   max_steps           Max trials per phase
+  safe_cap_mhz        Anchor mode: hard ceiling on tested gain over stock (MHz); --aggressive lifts it to step_mhz*max_steps
   stress_seconds      Duration per stress run (seconds; used in single-mode)
   multi_stress_seconds Per-mode duration when --doloming-mode is a comma-separated list
   temp_limit_c        Edge (GPU die) temperature abort threshold (°C)
@@ -48,6 +49,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     # TDP range: 160–280 W (2080 Ti FE 250 W, some OC editions higher)
     "rtx20": {
         "name": "RTX 20xx (Turing)",
+        "safe_cap_mhz": 150,
         "target_voltage_mv": 900,
         "step_mhz": 10,
         "step_mv": 5,
@@ -76,6 +78,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     # TDP range: 170–450 W (3090 Ti 450 W)
     "rtx30": {
         "name": "RTX 30xx (Ampere)",
+        "safe_cap_mhz": 200,
         "target_voltage_mv": 890,
         "step_mhz": 15,
         "step_mv": 5,
@@ -86,7 +89,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
         "hotspot_limit_c": 95,
         "power_limit_w": 380,
         "bin_min_mv": 450,
-        "bin_max_mv": 1000,
+        "bin_max_mv": 1050,
         "notes": (
             "Ampere GA102 chips (3080/3090 family) are power-hungry; "
             "set power_limit_w near your card's rated TDP. "
@@ -104,6 +107,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     # TDP range: 115–450 W (4090 FE 450 W)
     "rtx40": {
         "name": "RTX 40xx (Ada Lovelace)",
+        "safe_cap_mhz": 200,
         "target_voltage_mv": 950,
         "step_mhz": 15,
         "step_mv": 5,
@@ -132,6 +136,7 @@ GPU_PROFILES: Dict[str, Dict[str, Any]] = {
     # TDP range: 250–575 W (5090 575 W)
     "rtx50": {
         "name": "RTX 50xx (Blackwell)",
+        "safe_cap_mhz": 200,
         "target_voltage_mv": 962,
         "step_mhz": 15,
         "step_mv": 5,

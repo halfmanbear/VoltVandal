@@ -1,0 +1,1 @@
+{"workload": "simple", "loaded_samples": 30, "measured_samples": 30, "matched_samples": 30, "coverage_pct": 100.0, "target_voltage_mv": 850.0, "target_clock_mhz": 1875.0, "voltage_tolerance_mv": 3.0625}

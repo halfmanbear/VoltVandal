@@ -1,0 +1,2 @@
+{"workload": "canary", "loaded_samples": 23, "measured_samples": 23, "matched_samples": 18, "coverage_pct": 78.26086956521739, "target_voltage_mv": 975.0, "target_clock_mhz": 2010.0, "voltage_tolerance_mv": 3.0625}
+{"workload": "canary", "loaded_samples": 18, "measured_samples": 18, "matched_samples": 13, "coverage_pct": 72.22222222222223, "target_voltage_mv": 975.0, "target_clock_mhz": 2010.0, "voltage_tolerance_mv": 3.0625}

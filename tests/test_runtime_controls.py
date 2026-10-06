@@ -6,6 +6,7 @@ from voltvandal.hardware.runtime_controls import (
     apply_fan_control,
     apply_gpu_throttle_temp,
     apply_power_limit_percent,
+    apply_power_limit_max,
     read_gpu_target_temp,
     reset_gpu_throttle_temp,
     reset_power_limit_default,
@@ -68,6 +69,23 @@ def test_apply_power_limit_percent_clamps_to_supported_range(monkeypatch):
     assert state["set_limit_mw"] == 330000
     assert msg is not None
     assert "Clamped" in msg
+
+
+def test_apply_power_limit_max_uses_selected_gpu_and_reported_max(monkeypatch):
+    fake_module, state = _fake_pynvml(default_mw=320000, max_mw=370000)
+    selected = []
+
+    def get_handle(index):
+        selected.append(index)
+        return index
+
+    fake_module.nvmlDeviceGetHandleByIndex = get_handle
+    monkeypatch.setitem(sys.modules, "pynvml", fake_module)
+    msg = apply_power_limit_max(gpu_index=1)
+    assert selected == [1]
+    assert state["set_limit_mw"] == 370000
+    assert "GPU 1" in msg
+    assert "370.0 W" in msg
 
 
 def test_reset_power_limit_default_sets_driver_default(monkeypatch):

@@ -205,3 +205,15 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local-only: traces, crash dumps, RE tooling
+*_trace.jsonl
+tools/nvapi_trace/
+**/bsod/
+*.dmp
+*.i64
+*.idb
+*.id0
+*.id1
+*.nam
+*.til

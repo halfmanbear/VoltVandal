@@ -20,9 +20,19 @@ def _official_stress_script() -> Path:
     return _repo_root() / "gpu-cpu-stress-tests" / "nvidia_gpu_stress_test.py"
 
 
-def _build_official_stress_cmd(gpu: int, mode: str, seconds: int) -> List[str]:
+def _canary_script() -> Path:
+    return Path(__file__).resolve().with_name("canary.py")
+
+
+def _build_canary_cmd(gpu: int, seconds: int, util_pct: int = 0) -> List[str]:
+    return [sys.executable, "-u", str(_canary_script()), "--gpu", str(gpu),
+            "--seconds", str(seconds), "--target-percent", str(util_pct)]
+
+
+def _build_official_stress_cmd(gpu: int, mode: str, seconds: int, util_pct: int = 0) -> List[str]:
     cmd = [
         sys.executable,
+        "-u",  # Stream startup/progress output; CUDA initialization may be slow.
         str(_official_stress_script()),
         "-m",
         mode,
@@ -33,15 +43,42 @@ def _build_official_stress_cmd(gpu: int, mode: str, seconds: int) -> List[str]:
     ]
     # Safe defaults requested for official runner target utilization.
     if mode == "matrix":
-        cmd += ["-t", "75"]
+        cmd += ["-t", str(util_pct or 75)]
     elif mode == "ray":
-        cmd += ["-t", "85"]
+        cmd += ["-t", str(util_pct or 85)]
     return cmd
 
-def _reader_thread(pipe, lines: List[str], done: threading.Event) -> None:
+_FATAL_STRESS_OUTPUT = re.compile(
+    r"cuda_?error\w*|illegal memory access|device-side assert|"
+    r"unspecified launch failure|launch timeout|driver shutting down|"
+    r"Error during (?:stress )?test:",
+    re.I,
+)
+
+
+def _reader_thread(
+    pipe, lines: List[str], done: threading.Event,
+    fatal_event: Optional[threading.Event] = None,
+    live_log_path: Optional[Path] = None,
+) -> None:
     try:
-        for line in iter(pipe.readline, ""):
-            lines.append(line)
+        log = live_log_path.open("w", encoding="utf-8", errors="replace") if live_log_path else None
+        try:
+            last_flush = time.monotonic()
+            for line in iter(pipe.readline, ""):
+                lines.append(line)
+                if log:
+                    log.write(line)
+                if fatal_event and _FATAL_STRESS_OUTPUT.search(line):
+                    if log:
+                        log.flush()
+                    fatal_event.set()
+                elif log and time.monotonic() - last_flush >= 1.0:
+                    log.flush()
+                    last_flush = time.monotonic()
+        finally:
+            if log:
+                log.close()
         pipe.close()
     except Exception:
         pass
@@ -157,14 +194,17 @@ def run_doloming(
     interrupted_event: threading.Event,
     stress_timeout: Optional[int] = None,
     max_freq_mhz: int = 0,
+    util_pct: int = 0,
 ) -> Tuple[int, str]:
     if doloming_path and doloming_path not in ("auto", "integrated"):
         exe_is_py = doloming_path.lower().endswith(".py")
         cmd = (
-            [sys.executable, doloming_path, "--mode", mode, "--seconds", str(seconds)]
+            [sys.executable, "-u", doloming_path, "--mode", mode, "--seconds", str(seconds)]
             if exe_is_py
             else [doloming_path, "--mode", mode, "--seconds", str(seconds)]
         )
+    elif mode == "canary":
+        cmd = _build_canary_cmd(gpu=gpu, seconds=seconds, util_pct=util_pct)
     else:
         stress_script = _official_stress_script()
         if not stress_script.exists():
@@ -174,17 +214,23 @@ def run_doloming(
                 "OFFICIAL_STRESS_SCRIPT_NOT_FOUND",
             )
             return (1, out_text)
-        cmd = _build_official_stress_cmd(gpu=gpu, mode=mode, seconds=seconds)
+        cmd = _build_official_stress_cmd(gpu=gpu, mode=mode, seconds=seconds, util_pct=util_pct)
 
     p = start_process(cmd, cwd=workdir)
     output_lines: List[str] = []
     reader_done = threading.Event()
+    fatal_output = threading.Event()
     reader = threading.Thread(
-        target=_reader_thread, args=(p.stdout, output_lines, reader_done), daemon=True
+        target=_reader_thread,
+        args=(p.stdout, output_lines, reader_done, fatal_output, log_path),
+        daemon=True,
     )
     reader.start()
     deadline: Optional[float] = time.time() + stress_timeout if stress_timeout else None
-    no_output_timeout: float = float(max(20, min(90, seconds * 2)))
+    # Matrix setup can spend tens of seconds allocating and compiling CUDA
+    # kernels before its next complete output line. The hard stress timeout
+    # remains the upper bound for a genuinely stuck process.
+    no_output_timeout: float = float(max(90, min(180, seconds * 2)))
     last_output_line_count = 0
     last_output_ts = time.time()
     exit_code: Optional[int] = None
@@ -205,6 +251,11 @@ def run_doloming(
                 terminate_process_tree(p)
                 interrupted_by_user = True
                 exit_reason = "INTERRUPTED_BY_USER"
+                break
+            if fatal_output.is_set():
+                terminate_process_tree(p)
+                exit_code = 995
+                exit_reason = "FATAL_STRESS_OUTPUT"
                 break
             if abort_event.is_set():
                 terminate_process_tree(p)

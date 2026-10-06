@@ -1,0 +1,3 @@
+{"workload": "simple", "loaded_samples": 33, "measured_samples": 33, "matched_samples": 33, "coverage_pct": 100.0, "target_voltage_mv": 881.25, "target_clock_mhz": 1860.0, "voltage_tolerance_mv": 3.0625}
+{"workload": "simple", "loaded_samples": 32, "measured_samples": 32, "matched_samples": 32, "coverage_pct": 100.0, "target_voltage_mv": 881.25, "target_clock_mhz": 1860.0, "voltage_tolerance_mv": 3.0625}
+{"workload": "simple", "loaded_samples": 32, "measured_samples": 32, "matched_samples": 32, "coverage_pct": 100.0, "target_voltage_mv": 881.25, "target_clock_mhz": 1860.0, "voltage_tolerance_mv": 3.0625}
